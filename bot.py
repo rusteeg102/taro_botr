@@ -4,11 +4,7 @@ import os
 import random
 import base64
 import logging
-import hmac
-import hashlib
 import uuid
-import aiohttp
-import urllib.parse
 from aiohttp import web
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -37,6 +33,7 @@ from models import (
     get_reading_cost, set_reading_cost,
     get_individual_reading_cost, set_individual_reading_cost,
     get_palm_reading_cost, set_palm_reading_cost,
+    get_compatibility_reading_cost, set_compatibility_reading_cost,
     migrate_database
 )
 from config import (
@@ -46,11 +43,8 @@ from config import (
     OPENAI_MODEL,
     ADMIN_USER_IDS,
     MASTER_USERNAME,
-    ROBOKASSA_LOGIN,
-    ROBOKASSA_PASSWORD1,
-    ROBOKASSA_PASSWORD2,
-    ROBOKASSA_TEST_MODE,
-    ROBOKASSA_SIGNATURE_ALGORITHM,
+    YOOKASSA_SHOP_ID,
+    YOOKASSA_SECRET_KEY,
     WEB_SERVER_PORT,
 )
 from cards_data import TAROT_CARDS
@@ -81,6 +75,7 @@ class States(StatesGroup):
     SET_PRICE = State()
     SET_INDIVIDUAL_PRICE = State()
     SET_PALM_PRICE = State()
+    SET_COMPAT_PRICE = State()
     RESET_USER = State()
     PALM_PHOTO = State()
     COMPAT_NAME1 = State()
@@ -171,139 +166,98 @@ def is_admin(user_id):
     return user_id in ADMIN_USER_IDS
 
 
-async def create_robokassa_payment(amount: float, order_id: int, user_id: int) -> dict:
-    """Создает платеж в Robokassa и возвращает ссылку на оплату"""
-    if not ROBOKASSA_LOGIN or not ROBOKASSA_PASSWORD1:
-        return {'success': False, 'error': 'Robokassa не настроен'}
-
-    out_sum = f"{amount:.2f}"
-    inv_id = str(order_id)
-
-    # Строка подписи строго по документации: MerchantLogin:OutSum:InvId:Password1
-    signature_str = f"{ROBOKASSA_LOGIN}:{out_sum}:{inv_id}:{ROBOKASSA_PASSWORD1}"
-
-    if ROBOKASSA_SIGNATURE_ALGORITHM == 'sha256':
-        signature = hashlib.sha256(signature_str.encode('utf-8')).hexdigest()
-    else:  # md5
-        signature = hashlib.md5(signature_str.encode('utf-8')).hexdigest()
-
-    # Robokassa принимает подпись в любом регистре, используем lowercase
-    params = {
-        'MrchLogin': ROBOKASSA_LOGIN,
-        'OutSum': out_sum,
-        'InvId': inv_id,
-        'SignatureValue': signature,
-        'Encoding': 'utf-8',
-    }
-
-    if ROBOKASSA_TEST_MODE:
-        params['IsTest'] = '1'
-
-    base_url = "https://auth.robokassa.ru/Merchant/Index.aspx"
-    payment_url = f"{base_url}?{urllib.parse.urlencode(params)}"
-
-    logger.info(f"Robokassa | login={ROBOKASSA_LOGIN} out_sum={out_sum} inv_id={inv_id}")
-    logger.info(f"Robokassa | signature_str={signature_str!r}")
-    logger.info(f"Robokassa | signature={signature}")
-    logger.info(f"Robokassa | url={payment_url}")
-
-    return {
-        'success': True,
-        'payment_url': payment_url,
-        'payment_id': inv_id
-    }
-
-
-async def check_robokassa_payment(payment_id: str) -> dict:
-    """Проверяет статус платежа через Robokassa API"""
-    if not ROBOKASSA_LOGIN or not ROBOKASSA_PASSWORD2:
-        return {'success': False, 'error': 'Robokassa не настроен'}
-    
-    # Формирование подписи для проверки
-    inv_id = payment_id
-    signature_str = f"{ROBOKASSA_LOGIN}::{inv_id}:{ROBOKASSA_PASSWORD2}"
-    
-    # Выбираем алгоритм подписи
-    if ROBOKASSA_SIGNATURE_ALGORITHM == 'sha256':
-        signature = hashlib.sha256(signature_str.encode('utf-8')).hexdigest().upper()
-    else:  # md5
-        signature = hashlib.md5(signature_str.encode('utf-8')).hexdigest().upper()
-    
-    # URL для проверки статуса
-    base_url = "https://auth.robokassa.ru/Merchant/WebService/Service.asmx/OpStateExt"
-    
-    params = {
-        'MerchantLogin': ROBOKASSA_LOGIN,
-        'InvoiceID': inv_id,
-        'Signature': signature
-    }
-    
+async def create_yookassa_payment(amount: float, order_id: int, user_id: int) -> dict:
+    if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+        return {'success': False, 'error': 'ЮKassa не настроена'}
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(base_url, params=params) as response:
-                if response.status == 200:
-                    content = await response.text()
-                    # Проверка, успешен ли платеж (простая проверка XML ответа)
-                    if '<StateCode>100</StateCode>' in content or '<Code>0</Code>' in content:
-                        return {'success': True, 'paid': True}
-                    else:
-                        return {'success': True, 'paid': False}
-                else:
-                    return {'success': False, 'error': f'HTTP {response.status}'}
+        from yookassa import Configuration, Payment as YooPayment
+        Configuration.account_id = YOOKASSA_SHOP_ID
+        Configuration.secret_key = YOOKASSA_SECRET_KEY
+
+        payment = YooPayment.create({
+            "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
+            "confirmation": {"type": "redirect", "return_url": "https://t.me/mg_Taro_bot"},
+            "capture": True,
+            "description": f"Пополнение баланса на {amount:.2f} руб.",
+            "metadata": {"user_id": str(user_id), "request_id": str(order_id)}
+        }, str(uuid.uuid4()))
+
+        logger.info(f"YooKassa | payment_id={payment.id} amount={amount} user_id={user_id}")
+        return {
+            'success': True,
+            'payment_url': payment.confirmation.confirmation_url,
+            'payment_id': payment.id
+        }
     except Exception as e:
+        logger.error(f"YooKassa create payment error: {e}")
+        return {'success': False, 'error': str(e)}
+
+
+async def check_yookassa_payment(payment_id: str) -> dict:
+    if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
+        return {'success': False, 'error': 'ЮKassa не настроена'}
+    try:
+        from yookassa import Configuration, Payment as YooPayment
+        Configuration.account_id = YOOKASSA_SHOP_ID
+        Configuration.secret_key = YOOKASSA_SECRET_KEY
+
+        payment = YooPayment.find_one(payment_id)
+        return {'success': True, 'paid': payment.status == 'succeeded'}
+    except Exception as e:
+        logger.error(f"YooKassa check payment error: {e}")
         return {'success': False, 'error': str(e)}
 
 
 
 def main_menu_keyboard():
     keyboard = [
-        [InlineKeyboardButton(text="🔮 Сделать расклад", callback_data="start_standard_reading")],
-        [InlineKeyboardButton(text="❤️ Совместимость пары", callback_data="compatibility")],
-        [InlineKeyboardButton(text="✋ Хиромантия по фото", callback_data="start_palm_reading")],
-        [InlineKeyboardButton(text="✨ Живой расклад от мастера", callback_data="individual_reading")],
+        [InlineKeyboardButton(text="🔮 Сделать расклад", style="success", callback_data="start_standard_reading")],
+        [InlineKeyboardButton(text="❤️ Совместимость пары", style="success", callback_data="compatibility")],
+        [InlineKeyboardButton(text="✋ Хиромантия по фото", style="success", callback_data="start_palm_reading")],
+        [InlineKeyboardButton(text="✨ Живой расклад от мастера", style="success", callback_data="individual_reading")],
         [
-            InlineKeyboardButton(text="🌙 Карта дня", callback_data="daily_card"),
-            InlineKeyboardButton(text="<tg-emoji emoji-id=\"5904462880941545555\">💰</tg-emoji> Баланс", callback_data="show_balance")
+            InlineKeyboardButton(text="🌙 Карта дня", style="success", callback_data="daily_card"),
+            InlineKeyboardButton(text="Баланс", icon_custom_emoji_id="5904462880941545555", style="primary", callback_data="show_balance")
         ],
         [
-            InlineKeyboardButton(text="<tg-emoji emoji-id=\"6035084557378654059\">ℹ️</tg-emoji> Помощь", callback_data="help"),
-            InlineKeyboardButton(text="<tg-emoji emoji-id=\"6037421444789440735\">📖</tg-emoji> Что это?", callback_data="about_bot")
+            InlineKeyboardButton(text="Помощь", icon_custom_emoji_id="6034831751308644168", style="primary", callback_data="help"),
+            InlineKeyboardButton(text="Что это?", icon_custom_emoji_id="6041730074376410123", style="primary", callback_data="about_bot")
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def main_menu_button():
-    return InlineKeyboardButton(text="« Главное меню", callback_data="menu")
+    return InlineKeyboardButton(text="« Главное меню", style="primary", callback_data="menu")
 
 def back_to_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[main_menu_button()]])
 
 def admin_menu_keyboard():
     keyboard = [
-        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="📋 Список запросов на пополнение", callback_data="admin_requests")],
-        [InlineKeyboardButton(text="❓ Неотвеченные расклады", callback_data="admin_pending_readings")],
-        [InlineKeyboardButton(text="📂 Выгрузка пользователей (Excel)", callback_data="admin_export_users")],
-        [InlineKeyboardButton(text="📣 Рассылка пользователям", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="💰 Цены на расклады", callback_data="admin_set_prices")],
-        [InlineKeyboardButton(text="🔧 Сброс данных", callback_data="admin_reset")],
-        [InlineKeyboardButton(text="🏠 Вернуться в главное меню", callback_data="menu")],
+        [InlineKeyboardButton(icon_custom_emoji_id="5936143551854285132", text="Статистика", style="primary", callback_data="admin_stats")],
+        [InlineKeyboardButton(icon_custom_emoji_id="6039630677182254664", text="Список запросов на пополнение", style="primary", callback_data="admin_requests")],
+        [InlineKeyboardButton(icon_custom_emoji_id="6034831751308644168", text="Неотвеченные расклады", style="primary", callback_data="admin_pending_readings")],
+        [InlineKeyboardButton(icon_custom_emoji_id="6043874504302661409", text="Выгрузка пользователей (Excel)", style="primary", callback_data="admin_export_users")],
+        [InlineKeyboardButton(icon_custom_emoji_id="6039381989985882045", text="Рассылка пользователям", style="primary", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(icon_custom_emoji_id="5904462880941545555", text="Цены на расклады", style="primary", callback_data="admin_set_prices")],
+        [InlineKeyboardButton(icon_custom_emoji_id="6032742198179532882", text="Сброс данных", style="primary", callback_data="admin_reset")],
+        [InlineKeyboardButton(text="« Вернуться в главное меню", style="primary", callback_data="menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def reset_menu_keyboard():
     keyboard = [
-        [InlineKeyboardButton(text="📊 Сбросить статистику", callback_data="admin_reset_stats")],
-        [InlineKeyboardButton(text="❌ Сбросить все данные", callback_data="admin_reset_all")],
-        [InlineKeyboardButton(text="👤 Сбросить данные пользователя", callback_data="admin_reset_user")],
-        [InlineKeyboardButton(text="« Назад к админ-панели", callback_data="admin_menu")],
+        [InlineKeyboardButton(text="📊 Сбросить статистику", style="danger", callback_data="admin_reset_stats")],
+        [InlineKeyboardButton(text="Сбросить все данные", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="admin_reset_all")],
+        [InlineKeyboardButton(text="Сбросить данные пользователя", icon_custom_emoji_id="6035084557378654059", style="danger", callback_data="admin_reset_user")],
+        [InlineKeyboardButton(text="« Назад к админ-панели", style="primary", callback_data="admin_menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def confirm_reset_keyboard(reset_type):
     keyboard = [
-        [InlineKeyboardButton(text="✅ Подтвердить сброс", callback_data=f"admin_confirm_reset_{reset_type}")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_reset")],
+        [InlineKeyboardButton(text="Подтвердить сброс", icon_custom_emoji_id="5774022692642492953", style="success", callback_data=f"admin_confirm_reset_{reset_type}")],
+        [InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="admin_reset")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -311,9 +265,9 @@ def topup_amounts_keyboard():
     keyboard = []
     for i in range(0, len(TOPUP_AMOUNTS), 2):
         row = []
-        row.append(InlineKeyboardButton(text=f"{TOPUP_AMOUNTS[i]} руб.", callback_data=f"topup_amount_{TOPUP_AMOUNTS[i]}"))
+        row.append(InlineKeyboardButton(text=f"{TOPUP_AMOUNTS[i]} руб.", style="success", callback_data=f"topup_amount_{TOPUP_AMOUNTS[i]}"))
         if i + 1 < len(TOPUP_AMOUNTS):
-            row.append(InlineKeyboardButton(text=f"{TOPUP_AMOUNTS[i+1]} руб.", callback_data=f"topup_amount_{TOPUP_AMOUNTS[i+1]}"))
+            row.append(InlineKeyboardButton(text=f"{TOPUP_AMOUNTS[i+1]} руб.", style="success", callback_data=f"topup_amount_{TOPUP_AMOUNTS[i+1]}"))
         keyboard.append(row)
     keyboard.append([main_menu_button()])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -529,7 +483,7 @@ async def generate_compatibility_reading(name1: str, name2: str) -> str:
 async def compatibility_start(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     db = SessionLocal()
-    cost = get_reading_cost(db)
+    cost = get_compatibility_reading_cost(db)
     user = get_or_create_user(db, callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
     text = (
         "❤️ <b>Совместимость пары</b>\n\n"
@@ -538,7 +492,7 @@ async def compatibility_start(callback: types.CallbackQuery, state: FSMContext):
         f"💵 Ваш баланс: <b>{user.balance:.2f} руб.</b>"
     )
     keyboard = [
-        [InlineKeyboardButton(text="💑 Начать расклад", callback_data="confirm_compatibility")],
+        [InlineKeyboardButton(text="💑 Начать расклад", style="success", callback_data="confirm_compatibility")],
         [main_menu_button()]
     ]
     db.close()
@@ -549,11 +503,11 @@ async def compatibility_start(callback: types.CallbackQuery, state: FSMContext):
 async def confirm_compatibility(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     db = SessionLocal()
-    cost = get_reading_cost(db)
+    cost = get_compatibility_reading_cost(db)
     user = get_or_create_user(db, callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
     if user.balance < cost:
         await callback.message.edit_text(
-            f"❌ <b>Недостаточно средств.</b>\n"
+            f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> <b>Недостаточно средств.</b>\n"
             f"Стоимость: <b>{cost:.0f} руб.</b>\n"
             f"Баланс: <b>{user.balance:.2f} руб.</b>\n\n"
             "Пополните баланс через раздел 💰 Баланс.",
@@ -590,9 +544,9 @@ async def compat_name2(message: types.Message, state: FSMContext):
 
     if user.balance < cost:
         await message.answer(
-            f"❌ Недостаточно средств.\nСтоимость: {cost:.0f} руб.\nБаланс: {user.balance:.2f} руб.",
+            f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Недостаточно средств.\nСтоимость: {cost:.0f} руб.\nБаланс: {user.balance:.2f} руб.",
             reply_markup=back_to_menu_keyboard()
-        )
+        , parse_mode="HTML")
         await state.clear()
         db.close()
         return
@@ -641,9 +595,9 @@ async def compat_name2(message: types.Message, state: FSMContext):
     except Exception as e:
         logger.error(f"Compatibility reading error: {e}")
         await progress_msg.edit_text(
-            "❌ Произошла ошибка при генерации расклада. Попробуйте позже.",
+            "<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Произошла ошибка при генерации расклада. Попробуйте позже.",
             reply_markup=back_to_menu_keyboard()
-        )
+        , parse_mode="HTML")
 
 @dp.message(Command("start"))
 async def start(message: types.Message, state: FSMContext):
@@ -686,7 +640,7 @@ async def help_command(message: types.Message):
 @dp.message(Command("admin"))
 async def admin_command(message: types.Message):
     if not is_admin(message.from_user.id):
-        await message.answer("❌ У вас нет прав для доступа к админ-панели.", reply_markup=back_to_menu_keyboard())
+        await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> У вас нет прав для доступа к админ-панели.", reply_markup=back_to_menu_keyboard(), parse_mode="HTML")
         return
     
     await message.answer("🔐 Админ-панель:", reply_markup=admin_menu_keyboard())
@@ -733,7 +687,7 @@ async def show_balance(callback: types.CallbackQuery):
     
     text = f"💰 Ваш баланс: {user.balance:.2f} руб."
     keyboard = [
-        [InlineKeyboardButton(text="💵 Пополнить баланс", callback_data="topup")],
+        [InlineKeyboardButton(text="Пополнить баланс", icon_custom_emoji_id="5890848474563352982", style="success", callback_data="topup")],
         [main_menu_button()]
     ]
     
@@ -796,8 +750,8 @@ async def about_bot_callback(callback: types.CallbackQuery):
            "Мы делаем это не просто «по картам», а так, чтобы вам было ясно, спокойно и понятно. Все прозрачно, честно и с заботой о вас.\n\n"
     
     keyboard = [
-        [InlineKeyboardButton(text="<tg-emoji emoji-id=\"6037249452824072506\">🔒</tg-emoji> Политика конфиденциальности", url="https://telegra.ph/Politika-konfidencialnosti-servisa-mg-Taro-bot-06-05")],
-        [InlineKeyboardButton(text="<tg-emoji emoji-id=\"6037475557082403885\">📁</tg-emoji> Пользовательское соглашение", url="https://telegra.ph/Polzovatelskoe-soglashenie-servisa-mg-Taro-bot-06-05")],
+        [InlineKeyboardButton(text="Политика конфиденциальности", icon_custom_emoji_id="6037249452824072506", style="primary", url="https://telegra.ph/Politika-konfidencialnosti-servisa-mg-Taro-bot-06-05")],
+        [InlineKeyboardButton(text="Пользовательское соглашение", icon_custom_emoji_id="6035084557378654059", style="primary", url="https://telegra.ph/Polzovatelskoe-soglashenie-servisa-mg-Taro-bot-06-05")],
         [main_menu_button()]
     ]
     
@@ -813,9 +767,9 @@ async def choose_reading_type(callback: types.CallbackQuery):
     db.close()
     
     keyboard = [
-        [InlineKeyboardButton(text=f"🔮 Расклад от помощницы ({cost} руб.)", callback_data="start_reading")],
-        [InlineKeyboardButton(text=f"💎 Расклад от мастера ({individual_cost} руб.)", callback_data="start_individual_reading")],
-        [InlineKeyboardButton(text=f"✋ Расклад по ладони ({palm_cost} руб.)", callback_data="start_palm_reading")],
+        [InlineKeyboardButton(text=f"🔮 Расклад от помощницы ({cost} руб.)", style="success", callback_data="start_reading")],
+        [InlineKeyboardButton(text=f"💎 Расклад от мастера ({individual_cost} руб.)", style="success", callback_data="start_individual_reading")],
+        [InlineKeyboardButton(text=f"✋ Расклад по ладони ({palm_cost} руб.)", style="success", callback_data="start_palm_reading")],
         [main_menu_button()],
     ]
     
@@ -836,8 +790,8 @@ async def select_topup_amount(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(States.TOPUP_METHOD)
     
     keyboard = [
-        [InlineKeyboardButton(text="💳 Оплатить через Robokassa", callback_data="payment_method_robokassa")],
-        [InlineKeyboardButton(text="🔗 Перевод на карту (вручную)", callback_data="payment_method_manual")],
+        [InlineKeyboardButton(text="💳 Оплатить через ЮKassa", style="success", callback_data="payment_method_yookassa")],
+        [InlineKeyboardButton(text="Перевод на карту (вручную)", icon_custom_emoji_id="6028171274939797252", style="success", callback_data="payment_method_manual")],
         [main_menu_button()]
     ]
     
@@ -869,27 +823,28 @@ async def select_payment_method(callback: types.CallbackQuery, state: FSMContext
         db.refresh(topup_request)
         await state.update_data(topup_request_id=topup_request.id)
         
-        if method == "robokassa":
-            payment_result = await create_robokassa_payment(amount, topup_request.id, user.id)
+        if method == "yookassa":
+            payment_result = await create_yookassa_payment(amount, topup_request.id, user.id)
             if payment_result["success"]:
                 topup_request.robokassa_payment_id = payment_result["payment_id"]
                 db.commit()
                 keyboard = [
-                    [InlineKeyboardButton(text="💳 Оплатить через Robokassa", url=payment_result["payment_url"])],
+                    [InlineKeyboardButton(text="💳 Оплатить через ЮKassa", style="success", url=payment_result["payment_url"])],
+                    [InlineKeyboardButton(text="Проверить оплату", icon_custom_emoji_id="5774022692642492953", style="primary", callback_data=f"check_yookassa_{topup_request.id}")],
                     [main_menu_button()]
                 ]
                 text = f"💵 Пополнение на {amount:.2f} руб.\n\n" \
-                       "Нажмите на кнопку ниже для оплаты через Robokassa.\n" \
-                       "После успешной оплаты баланс будет пополнен автоматически в течение 5 минут."
+                       "Нажмите кнопку ниже для оплаты через ЮMoney.\n" \
+                       "После оплаты нажмите «Проверить оплату»."
                 await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
             else:
-                await callback.message.edit_text("❌ Ошибка создания платежа: " + payment_result["error"], reply_markup=back_to_menu_keyboard())
+                await callback.message.edit_text("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Ошибка создания платежа: " + payment_result["error"], reply_markup=back_to_menu_keyboard(), parse_mode="HTML")
                 await state.clear()
         elif method == "manual":
             await state.update_data(topup_amount=amount, topup_request_id=topup_request.id)
             keyboard = [
-                [InlineKeyboardButton(text="🔗 Открыть банк", url="https://t.tb.ru/c2c-qr-choose-bank?requisiteNumber=+79213385912&bankCode=100000000004")],
-                [InlineKeyboardButton(text="✅ Подтвердить оплату", callback_data="confirm_payment")],
+                [InlineKeyboardButton(text="Открыть банк", icon_custom_emoji_id="6028171274939797252", style="success", url="https://t.tb.ru/c2c-qr-choose-bank?requisiteNumber=+79213385912&bankCode=100000000004")],
+                [InlineKeyboardButton(text="Подтвердить оплату", icon_custom_emoji_id="5774022692642492953", style="success", callback_data="confirm_payment")],
             ]
             text = f"💵 Пополнение на {amount:.2f} руб.\n\n" \
                    "После перевода нажмите кнопку ниже:"
@@ -902,83 +857,85 @@ async def select_payment_method(callback: types.CallbackQuery, state: FSMContext
         db.close()
 
 
-@dp.callback_query(F.data.startswith("check_robokassa_"))
-async def check_robokassa_payment_callback(callback: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("check_yookassa_"))
+async def check_yookassa_payment_callback(callback: types.CallbackQuery):
     await callback.answer()
     try:
         request_id = int(callback.data.split("_")[2])
     except (IndexError, ValueError):
         await callback.answer("❌ Неверный формат.", show_alert=True)
         return
-    
+
     db = SessionLocal()
     try:
         topup_request = db.query(TopupRequest).filter(TopupRequest.id == request_id).first()
-        
+
         if not topup_request:
             await callback.answer("❌ Запрос не найден.", show_alert=True)
             return
-        
+
         if topup_request.is_approved:
             await callback.answer("✅ Оплата уже подтверждена!", show_alert=True)
-            await callback.message.edit_text("✅ Оплата уже подтверждена!", reply_markup=back_to_menu_keyboard())
+            await callback.message.edit_text("<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Оплата уже подтверждена!", reply_markup=back_to_menu_keyboard(), parse_mode="HTML")
             return
-        
+
         if topup_request.is_rejected:
             await callback.answer("❌ Запрос отклонён.", show_alert=True)
-            await callback.message.edit_text("❌ Запрос отклонён.", reply_markup=back_to_menu_keyboard())
+            await callback.message.edit_text("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Запрос отклонён.", reply_markup=back_to_menu_keyboard(), parse_mode="HTML")
             return
-        
+
         if not topup_request.robokassa_payment_id:
             await callback.answer("❌ Нет данных о платеже.", show_alert=True)
             return
-        
-        check_result = await check_robokassa_payment(topup_request.robokassa_payment_id)
-        
+
+        check_result = await check_yookassa_payment(topup_request.robokassa_payment_id)
+
         if not check_result["success"]:
             await callback.answer(f"❌ Ошибка проверки: {check_result.get('error')}", show_alert=True)
             return
-        
+
         if check_result.get("paid"):
             user = db.query(User).filter(User.id == topup_request.user_id).first()
             user.balance += topup_request.amount
-            
+
             transaction = Transaction(
                 user_id=user.id,
                 amount=topup_request.amount,
                 type="topup",
-                description=f"Пополнение баланса через Robokassa ({topup_request.amount} руб.)"
+                description=f"Пополнение баланса через ЮKassa ({topup_request.amount} руб.)"
             )
             db.add(transaction)
-            
+
             topup_request.is_approved = True
             topup_request.approved_at = datetime.now(pytz.UTC)
             db.commit()
-            
+
             await callback.message.edit_text(
-                f"✅ Оплата успешна! Ваш баланс пополнен на {topup_request.amount:.2f} руб.\n"
+                f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Оплата успешна! Ваш баланс пополнен на {topup_request.amount:.2f} руб.\n"
                 f"Текущий баланс: {user.balance:.2f} руб.",
-                reply_markup=back_to_menu_keyboard()
+                reply_markup=back_to_menu_keyboard(),
+                parse_mode="HTML"
             )
-            
-            logger.info(f"Robokassa payment {topup_request.robokassa_payment_id} approved: {topup_request.amount} RUB for user {user.telegram_id}")
-            
+
+            logger.info(f"YooKassa payment {topup_request.robokassa_payment_id} approved: {topup_request.amount} RUB for user {user.telegram_id}")
+
             for admin_id in ADMIN_USER_IDS:
                 try:
                     await bot.send_message(
                         chat_id=admin_id,
-                        text=f"✅ Оплата через Robokassa подтверждена автоматически!\n\n"
+                        text=f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Оплата через ЮKassa подтверждена!\n\n"
                              f"ID запроса: {request_id}\n"
                              f"Пользователь: {user.first_name or 'Unknown'}\n"
-                             f"Сумма: {topup_request.amount:.2f} руб."
+                             f"Сумма: {topup_request.amount:.2f} руб.",
+                        parse_mode="HTML"
                     )
                 except Exception as e:
                     logger.error(f"Failed to send admin notification: {e}")
         else:
-            await callback.answer("⌛ Оплата ещё не выполнена. Проверьте позже.", show_alert=True)
-            
+            await callback.answer("⌛ Оплата ещё не выполнена. Попробуйте позже.", show_alert=True)
+
     except Exception as e:
-        logger.error(f"Error in check_robokassa_payment_callback: {e}")
+        logger.error(f"Error in check_yookassa_payment_callback: {e}")
         await callback.answer("❌ Произошла ошибка. Попробуйте позже.", show_alert=True)
     finally:
         db.close()
@@ -993,7 +950,7 @@ async def confirm_payment(callback: types.CallbackQuery, state: FSMContext):
     
     if not amount or not request_id:
         await callback.answer("❌ Произошла ошибка. Попробуйте снова.", show_alert=True)
-        await callback.message.edit_text("❌ Произошла ошибка. Попробуйте снова.", reply_markup=back_to_menu_keyboard())
+        await callback.message.edit_text("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Произошла ошибка. Попробуйте снова.", reply_markup=back_to_menu_keyboard(), parse_mode="HTML")
         return
     
     db = SessionLocal()
@@ -1009,8 +966,8 @@ async def confirm_payment(callback: types.CallbackQuery, state: FSMContext):
         for admin_id in ADMIN_USER_IDS:
             try:
                 keyboard = [
-                    [InlineKeyboardButton(text=f"✅ Подтвердить {amount:.2f} руб.", callback_data=f"approve_{request_id}")],
-                    [InlineKeyboardButton(text=f"❌ Отклонить", callback_data=f"reject_{request_id}")],
+                    [InlineKeyboardButton(text=f"Подтвердить {amount:.2f} руб.", icon_custom_emoji_id="5774022692642492953", style="success", callback_data=f"approve_{request_id}")],
+                    [InlineKeyboardButton(text=f"Отклонить", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data=f"reject_{request_id}")],
                 ]
                 
                 await bot.send_message(
@@ -1027,10 +984,10 @@ async def confirm_payment(callback: types.CallbackQuery, state: FSMContext):
                 logger.error(f"Failed to send topup notification to admin {admin_id}: {str(e)}")
         
         await callback.message.edit_text(
-            "✅ Запрос отправлен администраторам на проверку.\n"
+            "<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Запрос отправлен администраторам на проверку.\n"
             "После подтверждения баланс будет пополнен.",
             reply_markup=back_to_menu_keyboard()
-        )
+        , parse_mode="HTML")
         
     except Exception as e:
         pass
@@ -1053,7 +1010,7 @@ async def approve_all_payments(callback: types.CallbackQuery):
         ).all()
         
         if not pending_requests:
-            await callback.message.edit_text("✅ Нет ожидающих запросов на пополнение.", reply_markup=admin_menu_keyboard())
+            await callback.message.edit_text("<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Нет ожидающих запросов на пополнение.", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
             db.close()
             return
         
@@ -1077,16 +1034,16 @@ async def approve_all_payments(callback: types.CallbackQuery):
             try:
                 await bot.send_message(
                     chat_id=user.telegram_id,
-                    text=f"✅ Ваш баланс успешно пополнен на {req.amount:.2f} руб.!\n"
+                    text=f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Ваш баланс успешно пополнен на {req.amount:.2f} руб.!\n"
                          f"Текущий баланс: {user.balance:.2f} руб."
-                )
+                , parse_mode="HTML")
             except Exception as e:
                 pass
         
         db.commit()
         logger.info(f"Approved {count} topup requests")
         
-        await callback.message.edit_text(f"✅ Успешно одобрено {count} заявок!", reply_markup=admin_menu_keyboard())
+        await callback.message.edit_text(f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Успешно одобрено {count} заявок!", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
         
     except Exception as e:
         await callback.answer("❌ Произошла ошибка.", show_alert=True)
@@ -1109,7 +1066,7 @@ async def reject_all_payments(callback: types.CallbackQuery):
         ).all()
         
         if not pending_requests:
-            await callback.message.edit_text("✅ Нет ожидающих запросов на пополнение.", reply_markup=admin_menu_keyboard())
+            await callback.message.edit_text("<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Нет ожидающих запросов на пополнение.", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
             db.close()
             return
         
@@ -1122,15 +1079,15 @@ async def reject_all_payments(callback: types.CallbackQuery):
             try:
                 await bot.send_message(
                     chat_id=user.telegram_id,
-                    text=f"❌ Ваш запрос на пополнение на {req.amount:.2f} руб. был отклонён."
-                )
+                    text=f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Ваш запрос на пополнение на {req.amount:.2f} руб. был отклонён."
+                , parse_mode="HTML")
             except Exception as e:
                 pass
         
         db.commit()
         logger.info(f"Rejected {count} topup requests")
         
-        await callback.message.edit_text(f"❌ Успешно отклонено {count} заявок!", reply_markup=admin_menu_keyboard())
+        await callback.message.edit_text(f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Успешно отклонено {count} заявок!", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
         
     except Exception as e:
         await callback.answer("❌ Произошла ошибка.", show_alert=True)
@@ -1181,18 +1138,18 @@ async def approve_payment(callback: types.CallbackQuery):
         try:
             await bot.send_message(
                 chat_id=user.telegram_id,
-                text=f"✅ Ваш баланс успешно пополнен на {topup_request.amount:.2f} руб.!\n"
+                text=f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Ваш баланс успешно пополнен на {topup_request.amount:.2f} руб.!\n"
                      f"Текущий баланс: {user.balance:.2f} руб."
-            )
+            , parse_mode="HTML")
         except Exception as e:
             pass
         
         await callback.message.edit_text(
-            f"✅ Запрос {request_id} подтверждён!\n"
+            f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Запрос {request_id} подтверждён!\n"
             f"Пользователь: {user.first_name or 'Unknown'}\n"
             f"Сумма: {topup_request.amount:.2f} руб.",
             reply_markup=admin_menu_keyboard()
-        )
+        , parse_mode="HTML")
         
     except Exception as e:
         await callback.answer("❌ Произошла ошибка.", show_alert=True)
@@ -1231,15 +1188,15 @@ async def reject_payment(callback: types.CallbackQuery):
         try:
             await bot.send_message(
                 chat_id=user.telegram_id,
-                text="❌ Ваш запрос на пополнение баланса был отклонён."
-            )
+                text="<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Ваш запрос на пополнение баланса был отклонён."
+            , parse_mode="HTML")
         except Exception as e:
             pass
         
         await callback.message.edit_text(
-            f"❌ Запрос {request_id} отклонён!",
+            f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Запрос {request_id} отклонён!",
             reply_markup=admin_menu_keyboard()
-        )
+        , parse_mode="HTML")
         
     except Exception as e:
         await callback.answer("❌ Произошла ошибка.", show_alert=True)
@@ -1263,7 +1220,7 @@ async def start_standard_reading(callback: types.CallbackQuery):
         text += f"💵 Текущий баланс: {user.balance:.2f} руб.\n"
     
     keyboard = [
-        [InlineKeyboardButton(text="🎯 Заказать расклад", callback_data="confirm_standard_reading")],
+        [InlineKeyboardButton(text="🎯 Заказать расклад", style="success", callback_data="confirm_standard_reading")],
         [main_menu_button()]
     ]
     
@@ -1281,23 +1238,23 @@ async def confirm_standard_reading(callback: types.CallbackQuery, state: FSMCont
         await state.update_data(questions=[], is_free=True)
         await state.set_state(States.QUESTION1)
         db.close()
-        await callback.message.edit_text(QUESTIONS[0], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu")]]))
+        await callback.message.edit_text(QUESTIONS[0], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
         return
     
     if user.balance < cost:
         await callback.message.edit_text(
-            f"❌ Недостаточно средств для расклада.\n"
+            f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Недостаточно средств для расклада.\n"
             f"Стоимость расклада: {cost:.2f} руб.\n"
             f"Пополните баланс, используя кнопку '💰 Баланс'.",
             reply_markup=back_to_menu_keyboard()
-        )
+        , parse_mode="HTML")
         db.close()
         return
     
     await state.update_data(questions=[], is_free=False)
     await state.set_state(States.QUESTION1)
     db.close()
-    await callback.message.edit_text(QUESTIONS[0], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu")]]))
+    await callback.message.edit_text(QUESTIONS[0], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
 
 @dp.message(States.QUESTION1)
 async def question1(message: types.Message, state: FSMContext):
@@ -1306,7 +1263,7 @@ async def question1(message: types.Message, state: FSMContext):
     questions.append(message.text)
     await state.update_data(questions=questions)
     await state.set_state(States.QUESTION2)
-    await message.answer(QUESTIONS[1], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu")]]))
+    await message.answer(QUESTIONS[1], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
 
 @dp.message(States.QUESTION2)
 async def question2(message: types.Message, state: FSMContext):
@@ -1315,7 +1272,7 @@ async def question2(message: types.Message, state: FSMContext):
     questions.append(message.text)
     await state.update_data(questions=questions)
     await state.set_state(States.QUESTION3)
-    await message.answer(QUESTIONS[2], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu")]]))
+    await message.answer(QUESTIONS[2], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
 
 @dp.message(States.QUESTION3)
 async def question3(message: types.Message, state: FSMContext):
@@ -1324,7 +1281,7 @@ async def question3(message: types.Message, state: FSMContext):
     questions.append(message.text)
     await state.update_data(questions=questions)
     await state.set_state(States.QUESTION4)
-    await message.answer(QUESTIONS[3], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu")]]))
+    await message.answer(QUESTIONS[3], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
 
 @dp.message(States.QUESTION4)
 async def question4(message: types.Message, state: FSMContext):
@@ -1333,7 +1290,7 @@ async def question4(message: types.Message, state: FSMContext):
     questions.append(message.text)
     await state.update_data(questions=questions)
     await state.set_state(States.QUESTION5)
-    await message.answer(QUESTIONS[4], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu")]]))
+    await message.answer(QUESTIONS[4], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
 
 @dp.message(States.QUESTION5)
 async def question5(message: types.Message, state: FSMContext):
@@ -1348,11 +1305,11 @@ async def question5(message: types.Message, state: FSMContext):
     
     if not is_free and user.balance < cost:
         await message.answer(
-            f"❌ Недостаточно средств для расклада.\n"
+            f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Недостаточно средств для расклада.\n"
             f"Стоимость расклада: {cost:.2f} руб.\n"
             f"Пополните баланс, используя кнопку '💰 Баланс'.",
             reply_markup=back_to_menu_keyboard()
-        )
+        , parse_mode="HTML")
         await state.clear()
         db.close()
         return
@@ -1407,9 +1364,9 @@ async def question5(message: types.Message, state: FSMContext):
         await progress_msg.edit_text(f"✨ Ваш расклад готов!\n\n{response}", reply_markup=back_to_menu_keyboard())
     except Exception as e:
         await progress_msg.edit_text(
-            "❌ Произошла ошибка при генерации расклада. Попробуйте позже.",
+            "<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Произошла ошибка при генерации расклада. Попробуйте позже.",
             reply_markup=back_to_menu_keyboard()
-        )
+        , parse_mode="HTML")
 
 @dp.callback_query(F.data == "individual_reading")
 @dp.callback_query(F.data == "start_individual_reading")
@@ -1427,7 +1384,7 @@ async def show_individual_reading(callback: types.CallbackQuery, state: FSMConte
     )
 
     keyboard = [
-        [InlineKeyboardButton(text="🎯 Оплатить расклад", callback_data="confirm_individual_reading")],
+        [InlineKeyboardButton(text="🎯 Оплатить расклад", style="success", callback_data="confirm_individual_reading")],
         [main_menu_button()]
     ]
 
@@ -1444,7 +1401,7 @@ async def confirm_individual_reading(callback: types.CallbackQuery, state: FSMCo
 
     if user.balance < cost:
         await callback.message.edit_text(
-            f"❌ <b>Недостаточно средств.</b>\n"
+            f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> <b>Недостаточно средств.</b>\n"
             f"Стоимость расклада: <b>{cost:.0f} руб.</b>\n"
             f"Ваш баланс: <b>{user.balance:.2f} руб.</b>\n\n"
             f"Пополните баланс через раздел 💰 Баланс.",
@@ -1498,7 +1455,7 @@ async def confirm_individual_reading(callback: types.CallbackQuery, state: FSMCo
     # Показываем пользователю сообщение с кнопкой на мастера
     master_url = f"https://t.me/{MASTER_USERNAME.lstrip('@')}" if MASTER_USERNAME else None
     success_text = (
-        "✅ <b>Оплата прошла успешно!</b>\n\n"
+        "<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> <b>Оплата прошла успешно!</b>\n\n"
         "🔮 Теперь напишите мастеру — опишите свою ситуацию или задайте вопрос.\n"
         "Мастер проведёт для вас личный расклад таро.\n\n"
         "👇 Нажмите кнопку ниже, чтобы перейти к мастеру:"
@@ -1506,7 +1463,7 @@ async def confirm_individual_reading(callback: types.CallbackQuery, state: FSMCo
 
     keyboard_rows = []
     if master_url:
-        keyboard_rows.append([InlineKeyboardButton(text="🔮 Написать мастеру", url=master_url)])
+        keyboard_rows.append([InlineKeyboardButton(text="🔮 Написать мастеру", style="success", url=master_url)])
     keyboard_rows.append([main_menu_button()])
 
     await callback.message.edit_text(
@@ -1542,7 +1499,7 @@ async def answer_reading_callback(callback: types.CallbackQuery, state: FSMConte
     
     await state.update_data(reading_id=reading_id)
     await state.set_state(States.ANSWER_READING)
-    await callback.message.answer("Введите ответ на расклад:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Назад к админ-панели", callback_data="admin_menu")]]))
+    await callback.message.answer("Введите ответ на расклад:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Назад к админ-панели", style="primary", callback_data="admin_menu")]]))
     db.close()
 
 @dp.message(States.ANSWER_READING)
@@ -1551,14 +1508,14 @@ async def send_reading_answer(message: types.Message, state: FSMContext):
     reading_id = data.get('reading_id')
     
     if not reading_id:
-        await message.answer("❌ Произошла ошибка.", reply_markup=admin_menu_keyboard())
+        await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Произошла ошибка.", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
         await state.clear()
         return
     
     db = SessionLocal()
     reading = db.query(Reading).filter(Reading.id == reading_id).first()
     if not reading:
-        await message.answer("❌ Расклад не найден.", reply_markup=admin_menu_keyboard())
+        await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Расклад не найден.", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
         await state.clear()
         db.close()
         return
@@ -1579,7 +1536,7 @@ async def send_reading_answer(message: types.Message, state: FSMContext):
     except Exception as e:
         pass
     
-    await message.answer("✅ Ответ отправлен пользователю!", reply_markup=admin_menu_keyboard())
+    await message.answer("<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Ответ отправлен пользователю!", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
     await state.clear()
     db.close()
 
@@ -1596,7 +1553,7 @@ async def start_palm_reading(callback: types.CallbackQuery):
     text += f"💵 Текущий баланс: {user.balance:.2f} руб.\n"
     
     keyboard = [
-        [InlineKeyboardButton(text="🎯 Заказать хиромантию", callback_data="confirm_palm_reading")],
+        [InlineKeyboardButton(text="🎯 Заказать хиромантию", style="success", callback_data="confirm_palm_reading")],
         [main_menu_button()]
     ]
     
@@ -1612,17 +1569,17 @@ async def confirm_palm_reading(callback: types.CallbackQuery, state: FSMContext)
     
     if user.balance < cost:
         await callback.message.edit_text(
-            f"❌ Недостаточно средств для расклада.\n"
+            f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Недостаточно средств для расклада.\n"
             f"Стоимость расклада: {cost:.2f} руб.\n"
             f"Пополните баланс, используя кнопку '💰 Баланс'.",
             reply_markup=back_to_menu_keyboard()
-        )
+        , parse_mode="HTML")
         db.close()
         return
     
     await state.set_state(States.PALM_PHOTO)
     db.close()
-    await callback.message.edit_text("Пожалуйста, отправьте фото вашей ладони:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="menu")]]))
+    await callback.message.edit_text("Пожалуйста, отправьте фото вашей ладони:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
 
 @dp.message(States.PALM_PHOTO, F.photo)
 async def handle_palm_photo(message: types.Message, state: FSMContext):
@@ -1632,11 +1589,11 @@ async def handle_palm_photo(message: types.Message, state: FSMContext):
     
     if user.balance < cost:
         await message.answer(
-            f"❌ Недостаточно средств для расклада.\n"
+            f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Недостаточно средств для расклада.\n"
             f"Стоимость расклада: {cost:.2f} руб.\n"
             f"Пополните баланс, используя кнопку '💰 Баланс'.",
             reply_markup=back_to_menu_keyboard()
-        )
+        , parse_mode="HTML")
         await state.clear()
         db.close()
         return
@@ -1692,9 +1649,9 @@ async def handle_palm_photo(message: types.Message, state: FSMContext):
         await progress_msg.edit_text(f"✨ Ваш расклад по ладони готов!\n\n{response}", reply_markup=back_to_menu_keyboard())
     except Exception as e:
         await progress_msg.edit_text(
-            "❌ Произошла ошибка при генерации расклада. Попробуйте позже.",
+            "<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Произошла ошибка при генерации расклада. Попробуйте позже.",
             reply_markup=back_to_menu_keyboard()
-        )
+        , parse_mode="HTML")
 
 @dp.callback_query(F.data == "admin_menu")
 async def show_admin_menu(callback: types.CallbackQuery):
@@ -1755,7 +1712,7 @@ async def admin_stats(callback: types.CallbackQuery):
     db.close()
     
     text = f"📊 Статистика:\n\n" \
-           f"👤 Всего пользователей: {total_users}\n" \
+           f"<tg-emoji emoji-id=\"6035084557378654059\">👤</tg-emoji> Всего пользователей: {total_users}\n" \
            f"🔮 Всего раскладов: {total_readings}\n" \
            f"💳 Всего транзакций: {total_transactions}\n" \
            f"💰 Общий баланс пользователей: {total_balance:.2f} руб.\n\n" \
@@ -1769,7 +1726,7 @@ async def admin_stats(callback: types.CallbackQuery):
            f"  • Доход: {revenue_month:.2f} руб.\n" \
            f"  • Раскладов: {readings_month}"
     
-    await callback.message.edit_text(text, reply_markup=admin_menu_keyboard())
+    await callback.message.edit_text(text, reply_markup=admin_menu_keyboard(), parse_mode="HTML")
 
 @dp.callback_query(F.data == "admin_requests")
 async def admin_requests(callback: types.CallbackQuery):
@@ -1786,7 +1743,7 @@ async def admin_requests(callback: types.CallbackQuery):
     ).all()
     
     if not pending_requests:
-        await callback.message.edit_text("✅ Нет ожидающих запросов на пополнение.", reply_markup=admin_menu_keyboard())
+        await callback.message.edit_text("<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Нет ожидающих запросов на пополнение.", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
         db.close()
         return
     
@@ -1800,16 +1757,16 @@ async def admin_requests(callback: types.CallbackQuery):
     
     keyboard = [
         [
-            InlineKeyboardButton(text="✅ Одобрить все заявки", callback_data="approve_all"),
-            InlineKeyboardButton(text="❌ Отклонить все заявки", callback_data="reject_all")
+            InlineKeyboardButton(text="Одобрить все заявки", icon_custom_emoji_id="5774022692642492953", style="success", callback_data="approve_all"),
+            InlineKeyboardButton(text="Отклонить все заявки", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="reject_all")
         ]
     ]
     for req in pending_requests:
         keyboard.append([
-            InlineKeyboardButton(text=f"✅ Подтвердить {req.id}", callback_data=f"approve_{req.id}"),
-            InlineKeyboardButton(text=f"❌ Отклонить {req.id}", callback_data=f"reject_{req.id}")
+            InlineKeyboardButton(text=f"Подтвердить {req.id}", icon_custom_emoji_id="5774022692642492953", style="success", callback_data=f"approve_{req.id}"),
+            InlineKeyboardButton(text=f"Отклонить {req.id}", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data=f"reject_{req.id}")
         ])
-    keyboard.append([InlineKeyboardButton(text="<< Назад к админ-панели", callback_data="admin_menu")])
+    keyboard.append([InlineKeyboardButton(text="<< Назад к админ-панели", style="primary", callback_data="admin_menu")])
     
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     db.close()
@@ -1829,7 +1786,7 @@ async def admin_pending_readings(callback: types.CallbackQuery):
     ).all()
 
     if not pending_readings:
-        await callback.message.edit_text("✅ Нет активных индивидуальных раскладов.", reply_markup=admin_menu_keyboard())
+        await callback.message.edit_text("<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Нет активных индивидуальных раскладов.", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
         db.close()
         return
 
@@ -1840,15 +1797,15 @@ async def admin_pending_readings(callback: types.CallbackQuery):
         user_name = user.first_name or user.username or str(user.telegram_id) if user else "Unknown"
         text += (
             f"📌 Расклад <b>#{reading.id}</b>\n"
-            f"👤 Пользователь: <b>{user_name}</b> (ID: <code>{user.telegram_id if user else '?'}</code>)\n"
+            f"<tg-emoji emoji-id=\"6035084557378654059\">👤</tg-emoji> Пользователь: <b>{user_name}</b> (ID: <code>{user.telegram_id if user else '?'}</code>)\n"
             f"💰 Стоимость: <b>{reading.cost:.0f} руб.</b>\n"
             f"🕐 Куплен: {reading.created_at.strftime('%d.%m.%Y %H:%M') if reading.created_at else '—'}\n\n"
         )
         keyboard.append([
-            InlineKeyboardButton(text=f"✅ Завершить #{reading.id}", callback_data=f"complete_reading_{reading.id}")
+            InlineKeyboardButton(text=f"Завершить #{reading.id}", icon_custom_emoji_id="5774022692642492953", style="success", callback_data=f"complete_reading_{reading.id}")
         ])
 
-    keyboard.append([InlineKeyboardButton(text="<< Назад к админ-панели", callback_data="admin_menu")])
+    keyboard.append([InlineKeyboardButton(text="<< Назад к админ-панели", style="primary", callback_data="admin_menu")])
 
     await callback.message.edit_text(
         text,
@@ -1900,7 +1857,7 @@ async def complete_reading_callback(callback: types.CallbackQuery, state: FSMCon
     ).all()
 
     if not pending_readings:
-        await callback.message.edit_text("✅ Нет активных индивидуальных раскладов.", reply_markup=admin_menu_keyboard())
+        await callback.message.edit_text("<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Нет активных индивидуальных раскладов.", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
         db2.close()
         return
 
@@ -1911,15 +1868,15 @@ async def complete_reading_callback(callback: types.CallbackQuery, state: FSMCon
         user_name = user.first_name or user.username or str(user.telegram_id) if user else "Unknown"
         text += (
             f"📌 Расклад <b>#{r.id}</b>\n"
-            f"👤 Пользователь: <b>{user_name}</b> (ID: <code>{user.telegram_id if user else '?'}</code>)\n"
+            f"<tg-emoji emoji-id=\"6035084557378654059\">👤</tg-emoji> Пользователь: <b>{user_name}</b> (ID: <code>{user.telegram_id if user else '?'}</code>)\n"
             f"💰 Стоимость: <b>{r.cost:.0f} руб.</b>\n"
             f"🕐 Куплен: {r.created_at.strftime('%d.%m.%Y %H:%M') if r.created_at else '—'}\n\n"
         )
         keyboard.append([
-            InlineKeyboardButton(text=f"✅ Завершить #{r.id}", callback_data=f"complete_reading_{r.id}")
+            InlineKeyboardButton(text=f"Завершить #{r.id}", icon_custom_emoji_id="5774022692642492953", style="success", callback_data=f"complete_reading_{r.id}")
         ])
 
-    keyboard.append([InlineKeyboardButton(text="<< Назад к админ-панели", callback_data="admin_menu")])
+    keyboard.append([InlineKeyboardButton(text="<< Назад к админ-панели", style="primary", callback_data="admin_menu")])
     await callback.message.edit_text(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
@@ -1965,7 +1922,7 @@ async def admin_export_users(callback: types.CallbackQuery):
         document=types.BufferedInputFile(excel_buffer.getvalue(), filename="users.xlsx"),
         caption="📂 Выгрузка пользователей"
     )
-    await callback.message.edit_text("✅ Выгрузка отправлена!", reply_markup=admin_menu_keyboard())
+    await callback.message.edit_text("<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Выгрузка отправлена!", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
     db.close()
 
 @dp.callback_query(F.data == "admin_broadcast")
@@ -1976,12 +1933,12 @@ async def admin_broadcast(callback: types.CallbackQuery, state: FSMContext):
     
     await callback.answer()
     await state.set_state(States.BROADCAST)
-    await callback.message.edit_text("Введите текст рассылки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Назад к админ-панели", callback_data="admin_menu")]]))
+    await callback.message.edit_text("Введите текст рассылки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Назад к админ-панели", style="primary", callback_data="admin_menu")]]))
 
 @dp.message(States.BROADCAST)
 async def send_broadcast(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
-        await message.answer("❌ У вас нет прав для выполнения этого действия.")
+        await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> У вас нет прав для выполнения этого действия.", parse_mode="HTML")
         await state.clear()
         return
     
@@ -1998,7 +1955,7 @@ async def send_broadcast(message: types.Message, state: FSMContext):
         except Exception as e:
             pass
     
-    await message.answer(f"✅ Рассылка отправлена!\nУспешно: {success_count}/{len(users)}", reply_markup=admin_menu_keyboard())
+    await message.answer(f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Рассылка отправлена!\nУспешно: {success_count}/{len(users)}", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
     await state.clear()
 
 @dp.callback_query(F.data == "admin_set_prices")
@@ -2012,15 +1969,17 @@ async def admin_set_prices(callback: types.CallbackQuery):
     cost = get_reading_cost(db)
     individual_cost = get_individual_reading_cost(db)
     palm_cost = get_palm_reading_cost(db)
+    compat_cost = get_compatibility_reading_cost(db)
     db.close()
-    
+
     keyboard = [
-        [InlineKeyboardButton(text=f"💎 Установить цену стандартного ({cost} руб.)", callback_data="set_price_standard")],
-        [InlineKeyboardButton(text=f"💎 Установить цену индивидуального ({individual_cost} руб.)", callback_data="set_price_individual")],
-        [InlineKeyboardButton(text=f"✋ Установить цену по ладони ({palm_cost} руб.)", callback_data="set_price_palm")],
-        [InlineKeyboardButton(text="« Назад к админ-панели", callback_data="admin_menu")],
+        [InlineKeyboardButton(text=f"💎 Установить цену стандартного ({cost} руб.)", style="primary", callback_data="set_price_standard")],
+        [InlineKeyboardButton(text=f"💎 Установить цену индивидуального ({individual_cost} руб.)", style="primary", callback_data="set_price_individual")],
+        [InlineKeyboardButton(text=f"✋ Установить цену по ладони ({palm_cost} руб.)", style="primary", callback_data="set_price_palm")],
+        [InlineKeyboardButton(text=f"❤️ Установить цену совместимости ({compat_cost} руб.)", style="primary", callback_data="set_price_compat")],
+        [InlineKeyboardButton(text="« Назад к админ-панели", style="primary", callback_data="admin_menu")],
     ]
-    
+
     await callback.message.edit_text("💰 Управление ценами:", reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 @dp.callback_query(F.data == "set_price_standard")
@@ -2031,12 +1990,12 @@ async def set_price_standard(callback: types.CallbackQuery, state: FSMContext):
     
     await callback.answer()
     await state.set_state(States.SET_PRICE)
-    await callback.message.edit_text("Введите новую цену для стандартного расклада:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Назад к админ-панели", callback_data="admin_menu")]]))
+    await callback.message.edit_text("Введите новую цену для стандартного расклада:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Назад к админ-панели", style="primary", callback_data="admin_menu")]]))
 
 @dp.message(States.SET_PRICE)
 async def handle_set_standard_price(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
-        await message.answer("❌ У вас нет прав для выполнения этого действия.")
+        await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> У вас нет прав для выполнения этого действия.", parse_mode="HTML")
         await state.clear()
         return
     
@@ -2045,14 +2004,14 @@ async def handle_set_standard_price(message: types.Message, state: FSMContext):
         if new_price < 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите корректную цену (положительное число).")
+        await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Введите корректную цену (положительное число).", parse_mode="HTML")
         return
     
     db = SessionLocal()
     set_reading_cost(db, new_price)
     db.close()
     
-    await message.answer(f"✅ Цена стандартного расклада установлена на {new_price} руб.", reply_markup=admin_menu_keyboard())
+    await message.answer(f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Цена стандартного расклада установлена на {new_price} руб.", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
     await state.clear()
 
 @dp.callback_query(F.data == "set_price_individual")
@@ -2063,12 +2022,12 @@ async def set_price_individual(callback: types.CallbackQuery, state: FSMContext)
     
     await callback.answer()
     await state.set_state(States.SET_INDIVIDUAL_PRICE)
-    await callback.message.edit_text("Введите новую цену для индивидуального расклада:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Назад к админ-панели", callback_data="admin_menu")]]))
+    await callback.message.edit_text("Введите новую цену для индивидуального расклада:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Назад к админ-панели", style="primary", callback_data="admin_menu")]]))
 
 @dp.message(States.SET_INDIVIDUAL_PRICE)
 async def handle_set_individual_price(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
-        await message.answer("❌ У вас нет прав для выполнения этого действия.")
+        await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> У вас нет прав для выполнения этого действия.", parse_mode="HTML")
         await state.clear()
         return
     
@@ -2077,14 +2036,14 @@ async def handle_set_individual_price(message: types.Message, state: FSMContext)
         if new_price < 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите корректную цену (положительное число).")
+        await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Введите корректную цену (положительное число).", parse_mode="HTML")
         return
     
     db = SessionLocal()
     set_individual_reading_cost(db, new_price)
     db.close()
     
-    await message.answer(f"✅ Цена индивидуального расклада установлена на {new_price} руб.", reply_markup=admin_menu_keyboard())
+    await message.answer(f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Цена индивидуального расклада установлена на {new_price} руб.", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
     await state.clear()
 
 @dp.callback_query(F.data == "set_price_palm")
@@ -2095,12 +2054,12 @@ async def set_price_palm(callback: types.CallbackQuery, state: FSMContext):
     
     await callback.answer()
     await state.set_state(States.SET_PALM_PRICE)
-    await callback.message.edit_text("Введите новую цену для расклада по ладони:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Назад к админ-панели", callback_data="admin_menu")]]))
+    await callback.message.edit_text("Введите новую цену для расклада по ладони:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Назад к админ-панели", style="primary", callback_data="admin_menu")]]))
 
 @dp.message(States.SET_PALM_PRICE)
 async def handle_set_palm_price(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
-        await message.answer("❌ У вас нет прав для выполнения этого действия.")
+        await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> У вас нет прав для выполнения этого действия.", parse_mode="HTML")
         await state.clear()
         return
     
@@ -2109,14 +2068,46 @@ async def handle_set_palm_price(message: types.Message, state: FSMContext):
         if new_price < 0:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите корректную цену (положительное число).")
+        await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Введите корректную цену (положительное число).", parse_mode="HTML")
         return
     
     db = SessionLocal()
     set_palm_reading_cost(db, new_price)
     db.close()
     
-    await message.answer(f"✅ Цена расклада по ладони установлена на {new_price} руб.", reply_markup=admin_menu_keyboard())
+    await message.answer(f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Цена расклада по ладони установлена на {new_price} руб.", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
+    await state.clear()
+
+@dp.callback_query(F.data == "set_price_compat")
+async def set_price_compat(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ У вас нет прав для доступа к админ-панели.", show_alert=True)
+        return
+
+    await callback.answer()
+    await state.set_state(States.SET_COMPAT_PRICE)
+    await callback.message.edit_text("Введите новую цену для расклада совместимости:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Назад к админ-панели", style="primary", callback_data="admin_menu")]]))
+
+@dp.message(States.SET_COMPAT_PRICE)
+async def handle_set_compat_price(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> У вас нет прав для выполнения этого действия.", parse_mode="HTML")
+        await state.clear()
+        return
+
+    try:
+        new_price = int(message.text)
+        if new_price < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Введите корректную цену (положительное число).", parse_mode="HTML")
+        return
+
+    db = SessionLocal()
+    set_compatibility_reading_cost(db, new_price)
+    db.close()
+
+    await message.answer(f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Цена расклада совместимости установлена на {new_price} руб.", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
     await state.clear()
 
 @dp.callback_query(F.data == "admin_reset")
@@ -2159,7 +2150,7 @@ async def admin_perform_reset(callback: types.CallbackQuery, state: FSMContext):
         for user in db.query(User).all():
             user.balance = 0
         db.commit()
-        await callback.message.edit_text("✅ Статистика сброшена!", reply_markup=admin_menu_keyboard())
+        await callback.message.edit_text("<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Статистика сброшена!", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
     
     elif reset_type == "all":
         db.query(Reading).delete()
@@ -2168,32 +2159,32 @@ async def admin_perform_reset(callback: types.CallbackQuery, state: FSMContext):
         db.query(User).delete()
         db.query(Setting).delete()
         db.commit()
-        await callback.message.edit_text("✅ Все данные сброшены!", reply_markup=admin_menu_keyboard())
+        await callback.message.edit_text("<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Все данные сброшены!", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
     
     elif reset_type == "user":
         await state.set_state(States.RESET_USER)
-        await callback.message.edit_text("Введите Telegram ID пользователя:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Назад к админ-панели", callback_data="admin_menu")]]))
+        await callback.message.edit_text("Введите Telegram ID пользователя:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="« Назад к админ-панели", style="primary", callback_data="admin_menu")]]))
     
     db.close()
 
 @dp.message(States.RESET_USER)
 async def reset_user(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
-        await message.answer("❌ У вас нет прав для выполнения этого действия.")
+        await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> У вас нет прав для выполнения этого действия.", parse_mode="HTML")
         await state.clear()
         return
     
     try:
         telegram_id = int(message.text)
     except ValueError:
-        await message.answer("❌ Введите корректный ID (число).")
+        await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Введите корректный ID (число).", parse_mode="HTML")
         return
     
     db = SessionLocal()
     user = db.query(User).filter(User.telegram_id == telegram_id).first()
     
     if not user:
-        await message.answer("❌ Пользователь не найден.", reply_markup=admin_menu_keyboard())
+        await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Пользователь не найден.", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
         await state.clear()
         db.close()
         return
@@ -2204,7 +2195,7 @@ async def reset_user(message: types.Message, state: FSMContext):
     db.query(TopupRequest).filter(TopupRequest.user_id == user.id).delete()
     db.commit()
     
-    await message.answer(f"✅ Данные пользователя {user.first_name or 'Unknown'} сброшены!", reply_markup=admin_menu_keyboard())
+    await message.answer(f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Данные пользователя {user.first_name or 'Unknown'} сброшены!", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
     await state.clear()
     db.close()
 

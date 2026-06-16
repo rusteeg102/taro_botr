@@ -17,9 +17,6 @@ ADMIN_USER_IDS = [int(id_str.strip()) for id_str in admin_ids_str.split(',') if 
 
 MASTER_USERNAME = os.getenv('MASTER_USERNAME', '').strip()
 
-ROBOKASSA_LOGIN = os.getenv('ROBOKASSA_LOGIN', '').strip()
-ROBOKASSA_PASSWORD1 = os.getenv('ROBOKASSA_PASSWORD1', '').strip()
-ROBOKASSA_PASSWORD2 = os.getenv('ROBOKASSA_PASSWORD2', '').strip()
-ROBOKASSA_TEST_MODE = os.getenv('ROBOKASSA_TEST_MODE', 'true').lower() == 'true'
-ROBOKASSA_SIGNATURE_ALGORITHM = os.getenv('ROBOKASSA_SIGNATURE_ALGORITHM', 'md5').lower()
+YOOKASSA_SHOP_ID = os.getenv('YOOKASSA_SHOP_ID', '').strip()
+YOOKASSA_SECRET_KEY = os.getenv('YOOKASSA_SECRET_KEY', '').strip()
 WEB_SERVER_PORT = int(os.getenv('WEB_SERVER_PORT', '8000'))

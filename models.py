@@ -170,3 +170,18 @@ def set_palm_reading_cost(db, new_cost):
         cost.value = str(new_cost)
     db.add(cost)
     db.commit()
+
+def get_compatibility_reading_cost(db):
+    cost = db.query(Setting).filter(Setting.key == 'compatibility_reading_cost').first()
+    if not cost:
+        return 300
+    return int(float(cost.value))
+
+def set_compatibility_reading_cost(db, new_cost):
+    cost = db.query(Setting).filter(Setting.key == 'compatibility_reading_cost').first()
+    if not cost:
+        cost = Setting(key='compatibility_reading_cost', value=str(new_cost))
+    else:
+        cost.value = str(new_cost)
+    db.add(cost)
+    db.commit()
