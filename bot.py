@@ -979,7 +979,7 @@ async def start_standard_reading(callback: types.CallbackQuery):
     user = get_or_create_user(db, callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
     
     text = "🔮 **Стандартный расклад Таро**\n\n"
-    text += "Получите детальный ответ на 5 вопросов с анализом карт прошлого, настоящего и будущего.\n\n"
+    text += "Задайте свой вопрос и получите расклад с анализом карт прошлого, настоящего и будущего.\n\n"
     
     if not user.has_used_free_reading:
         text += f"🎁 Ваш первый расклад — **бесплатно**!\n"
