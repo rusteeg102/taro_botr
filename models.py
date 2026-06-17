@@ -185,3 +185,18 @@ def set_compatibility_reading_cost(db, new_cost):
         cost.value = str(new_cost)
     db.add(cost)
     db.commit()
+
+def get_demo_balance(db) -> bool:
+    setting = db.query(Setting).filter(Setting.key == 'demo_balance_enabled').first()
+    if not setting:
+        return True  # по умолчанию демо включено
+    return setting.value == '1'
+
+def set_demo_balance(db, enabled: bool):
+    setting = db.query(Setting).filter(Setting.key == 'demo_balance_enabled').first()
+    if not setting:
+        setting = Setting(key='demo_balance_enabled', value='1' if enabled else '0')
+    else:
+        setting.value = '1' if enabled else '0'
+    db.add(setting)
+    db.commit()

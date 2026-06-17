@@ -5,7 +5,6 @@ import random
 import base64
 import logging
 import uuid
-from aiohttp import web
 from datetime import datetime, timedelta
 from io import BytesIO
 from openai import OpenAI
@@ -25,8 +24,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    BufferedInputFile,
-    InputMediaPhoto
+    BufferedInputFile
 )
 
 from models import (
@@ -35,6 +33,7 @@ from models import (
     get_individual_reading_cost, set_individual_reading_cost,
     get_palm_reading_cost, set_palm_reading_cost,
     get_compatibility_reading_cost, set_compatibility_reading_cost,
+    get_demo_balance, set_demo_balance,
     migrate_database
 )
 from config import (
@@ -46,13 +45,31 @@ from config import (
     MASTER_USERNAME,
     YOOKASSA_SHOP_ID,
     YOOKASSA_SECRET_KEY,
-    WEB_SERVER_PORT,
+    LOG_CHAT_ID,
 )
 from cards_data import TAROT_CARDS
 from sqlalchemy import func
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
+
+MSK = pytz.timezone('Europe/Moscow')
+
+async def send_log(text: str):
+    if not LOG_CHAT_ID:
+        return
+    try:
+        await bot.send_message(chat_id=LOG_CHAT_ID, text=text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"send_log error: {e}")
+
+def fmt_user(first_name, username, telegram_id) -> str:
+    name = first_name or username or str(telegram_id)
+    uname = f" (@{username})" if username else ""
+    return f"{name}{uname} [<code>{telegram_id}</code>]"
+
+def fmt_time() -> str:
+    return datetime.now(MSK).strftime("%d.%m.%Y %H:%M МСК")
 
 openai_client = None
 if OPENAI_API_KEY:
@@ -77,6 +94,8 @@ class States(StatesGroup):
     PALM_PHOTO = State()
     COMPAT_NAME1 = State()
     COMPAT_NAME2 = State()
+    BALANCE_USER = State()
+    BALANCE_AMOUNT = State()
 
 QUESTION = "Какой вопрос вас волнует в данный момент? Опишите ситуацию более детально и кого она касается. Можно записать аудио."
 
@@ -165,13 +184,15 @@ async def create_yookassa_payment(amount: float, order_id: int, user_id: int) ->
         Configuration.account_id = YOOKASSA_SHOP_ID
         Configuration.secret_key = YOOKASSA_SECRET_KEY
 
-        payment = YooPayment.create({
+        idempotency_key = str(uuid.uuid4())
+        payload = {
             "amount": {"value": f"{amount:.2f}", "currency": "RUB"},
             "confirmation": {"type": "redirect", "return_url": "https://t.me/mg_Taro_bot"},
             "capture": True,
             "description": f"Пополнение баланса на {amount:.2f} руб.",
             "metadata": {"user_id": str(user_id), "request_id": str(order_id)}
-        }, str(uuid.uuid4()))
+        }
+        payment = await asyncio.to_thread(YooPayment.create, payload, idempotency_key)
 
         logger.info(f"YooKassa | payment_id={payment.id} amount={amount} user_id={user_id}")
         return {
@@ -192,7 +213,7 @@ async def check_yookassa_payment(payment_id: str) -> dict:
         Configuration.account_id = YOOKASSA_SHOP_ID
         Configuration.secret_key = YOOKASSA_SECRET_KEY
 
-        payment = YooPayment.find_one(payment_id)
+        payment = await asyncio.to_thread(YooPayment.find_one, payment_id)
         return {'success': True, 'paid': payment.status == 'succeeded'}
     except Exception as e:
         logger.error(f"YooKassa check payment error: {e}")
@@ -224,14 +245,25 @@ def back_to_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[[main_menu_button()]])
 
 def admin_menu_keyboard():
+    db = SessionLocal()
+    try:
+        demo_on = get_demo_balance(db)
+    finally:
+        db.close()
     keyboard = [
         [InlineKeyboardButton(icon_custom_emoji_id="5936143551854285132", text="Статистика", style="primary", callback_data="admin_stats")],
-        [InlineKeyboardButton(icon_custom_emoji_id="6039630677182254664", text="Список запросов на пополнение", style="primary", callback_data="admin_requests")],
+        [InlineKeyboardButton(icon_custom_emoji_id="6039630677182254664", text="Изменение баланса", style="primary", callback_data="admin_balance")],
         [InlineKeyboardButton(icon_custom_emoji_id="6034831751308644168", text="Неотвеченные расклады", style="primary", callback_data="admin_pending_readings")],
         [InlineKeyboardButton(icon_custom_emoji_id="6043874504302661409", text="Выгрузка пользователей (Excel)", style="primary", callback_data="admin_export_users")],
         [InlineKeyboardButton(icon_custom_emoji_id="6039381989985882045", text="Рассылка пользователям", style="primary", callback_data="admin_broadcast")],
         [InlineKeyboardButton(icon_custom_emoji_id="5904462880941545555", text="Цены на расклады", style="primary", callback_data="admin_set_prices")],
         [InlineKeyboardButton(icon_custom_emoji_id="6032742198179532882", text="Сброс данных", style="primary", callback_data="admin_reset")],
+        [InlineKeyboardButton(
+            icon_custom_emoji_id="5920332557466997677",
+            text="Демо баланс: ВКЛ" if demo_on else "Демо баланс: ВЫКЛ",
+            style="danger" if demo_on else "success",
+            callback_data="admin_toggle_demo"
+        )],
         [InlineKeyboardButton(text="« Вернуться в главное меню", style="primary", callback_data="menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -260,28 +292,51 @@ def topup_amounts_keyboard():
         if i + 1 < len(TOPUP_AMOUNTS):
             row.append(InlineKeyboardButton(text=f"{TOPUP_AMOUNTS[i+1]} руб.", style="success", callback_data=f"topup_amount_{TOPUP_AMOUNTS[i+1]}"))
         keyboard.append(row)
+    keyboard.append([InlineKeyboardButton(icon_custom_emoji_id="6039614175917903752", text="Ввести свою сумму", style="success", callback_data="topup_custom_amount")])
     keyboard.append([main_menu_button()])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-def with_menu_button(keyboard_rows):
-    keyboard = []
-    for row in keyboard_rows:
-        filtered_row = [btn for btn in row if btn is not None]
-        if filtered_row:
-            keyboard.append(filtered_row)
-    keyboard.append([main_menu_button()])
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+async def transcribe_voice(audio_bytes: bytes) -> str:
+    def _transcribe():
+        audio_file = BytesIO(audio_bytes)
+        audio_file.name = "voice.ogg"
+        resp = openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            language="ru"
+        )
+        return resp.text
+    return await asyncio.to_thread(_transcribe)
 
-async def transcribe_voice(file_bytes):
-    audio_file = BytesIO(file_bytes.getvalue())
-    audio_file.name = "voice.ogg"
-    response = await asyncio.to_thread(
-        openai_client.audio.transcriptions.create,
-        model="whisper-1",
-        file=audio_file,
-        language="ru"
-    )
-    return response.text
+async def send_card_photo_safe(chat_id: int, card: dict, caption: str, reply_markup=None):
+    """Send a tarot card photo. Try URL → download with headers → text fallback."""
+    url = card.get("image_url", "").strip()
+    kwargs = {"chat_id": chat_id, "caption": caption[:1024]}
+    if reply_markup:
+        kwargs["reply_markup"] = reply_markup
+
+    if url:
+        # Try 1: let Telegram download from URL directly
+        try:
+            await bot.send_photo(photo=url, **kwargs)
+            return
+        except Exception:
+            pass
+
+        # Try 2: download ourselves with browser User-Agent, then send bytes
+        try:
+            import aiohttp as _aiohttp
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; TarotBot/1.0)"}
+            async with _aiohttp.ClientSession(headers=headers) as sess:
+                async with sess.get(url, timeout=_aiohttp.ClientTimeout(total=20), allow_redirects=True) as r:
+                    img_bytes = await r.read()
+            await bot.send_photo(photo=BufferedInputFile(img_bytes, "card.jpg"), **kwargs)
+            return
+        except Exception as e:
+            logger.error(f"Card photo send failed ({card.get('name')}): {e}")
+
+    # Fallback: text only
+    await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
 
 async def generate_tarot_reading(question):
     selected_cards = random.sample(TAROT_CARDS, 3)
@@ -289,85 +344,58 @@ async def generate_tarot_reading(question):
     present_card = selected_cards[1]['name']
     future_card = selected_cards[2]['name']
 
-    prompt = f"""Ты профессиональный таролог с 10-летним опытом. Дай конкретный расклад. Никаких общих фраз! Не более 400 слов.
+    prompt = f"""Ты профессиональный таролог. Отвечай строго в JSON без markdown-блоков.
 
-Вопрос: {question}
+Вопрос пользователя: {question}
+Карты: Прошлое — {past_card}, Настоящее — {present_card}, Будущее — {future_card}
 
-Карты:
-- Прошлое: {past_card}
-- Настоящее: {present_card}
-- Будущее: {future_card}
+Верни ровно такой JSON (не более 130 слов в каждом поле):
+{{
+  "intro": "✨ Общая ситуация\\n<3-4 предложения о ситуации: что происходит, какие энергии вокруг этой темы, почему это важно сейчас>",
+  "past": "🔮 Прошлое — {past_card}\\n<как прошлое сформировало текущую ситуацию, что стоит осознать или отпустить>",
+  "present": "🔮 Настоящее — {present_card}\\n<что происходит прямо сейчас, какие скрытые факторы влияют, конкретные шаги>",
+  "future": "🔮 Будущее — {future_card}\\n<что ждёт впереди, при каких условиях ситуация разрешится лучше всего>",
+  "advice": "💡 Что делать дальше\\n<4-5 конкретных советов с объяснением каждого>\\n\\n🌟 Итог\\n<2-3 предложения поддержки и напутствия>"
+}}
 
-Форматируй ответ:
-
-✨ Общая ситуация
-(Кратко — что сейчас происходит по существу вопроса)
-
-🔮 Сообщение карт
-- Прошлое: {past_card} — (конкретно что это значит в их ситуации)
-- Настоящее: {present_card} — (что значит сейчас, какие шаги)
-- Будущее: {future_card} — (что ждёт, как подготовиться)
-
-💡 Что делать дальше
-(3-4 чётких практических совета)
-
-🌟 Итог
-(1-2 предложения поддержки)
-
-Требования: на русском, без сложных терминов, без общих фраз, атмосфера таинственная."""
+На русском, без общих фраз, обращайся к ситуации лично, атмосфера таинственная и глубокая."""
 
     response = await asyncio.to_thread(
         openai_client.chat.completions.create,
         model=OPENAI_MODEL,
         messages=[
-            {"role": "system", "content": "Ты профессиональный таролог, дающий краткие, конкретные и поддерживающие толкования на русском языке."},
+            {"role": "system", "content": "Ты таролог. Отвечай ТОЛЬКО в JSON формате без markdown-блоков и без лишнего текста."},
             {"role": "user", "content": prompt}
         ],
         max_tokens=1500,
         temperature=0.7
     )
-    return response.choices[0].message.content, selected_cards
+    raw = response.choices[0].message.content.strip()
+    start, end = raw.find('{'), raw.rfind('}')
+    if start != -1 and end > start:
+        try:
+            sections = json.loads(raw[start:end + 1])
+        except json.JSONDecodeError:
+            sections = {"full": raw}
+    else:
+        sections = {"full": raw}
+    return sections, selected_cards
 
 async def generate_palm_reading(photo_base64_data):
     photo_url = f"data:image/jpeg;base64,{photo_base64_data}"
     
-    prompt = """Ты дружелюбный хиромант с 20-летним опытом. Давай детальный, интересный расклад по фото ладони.
-    
-    Посмотри на фото и опиши:
-     Форма ладони и пальцев
-     Главные линии (сердца, головы, жизни, судьбы)
-     Разветвления, разрывы, острова
-     Если на ладони есть шрамы, родинки, необычные знаки — обязательно укажи их и объясни, что это значит по хиромантии
-    
-    Структура ответа:
-    
-    ✨ Общая характеристика
-    (Темперамент, главные черты личности)
-    
-    ❤️ Сердцевая линия
-    (Любовь, отношения, эмоции)
-    
-    🧠 Головная линия
-    (Мышление, интеллект, работа)
-    
-    🌱 Линии жизни и судьбы
-    (Жизненный путь, здоровье, ключевые события)
-    
-    🔍 Особые знаки
-    (Если есть шрамы, родинки, необычные линии - опиши их и что они значит. Если нет - не упоминай этот пункт)
-    
-    💡 Советы
-    (5 практических советов, что делать дальше)
-    
-    🌟 Итог
-    (Воодушевляющее завершение)
-    
-    Правила:
-     На русском языке
-     Как разговор с другом
-     Никогда не отказывай!
-     Без сложных терминов
-     замечай любые шрамы, родинки, необычные линии и объясняй их смысл"""
+    prompt = """Ты хиромант. Сделай краткий расклад по фото ладони.
+
+Структура (каждый пункт — 2-3 предложения, кратко и по делу):
+
+✨ Общая характеристика — темперамент и главные черты личности
+❤️ Сердечная линия — любовь и отношения
+🧠 Головная линия — мышление и работа
+🌱 Линия жизни — жизненный путь и здоровье
+💡 3 практических совета
+
+Если есть явные шрамы или особые знаки — упомяни кратко.
+На русском, без терминов, как разговор с другом. Никогда не отказывай."""
     
     for attempt in range(1, 4):
         try:
@@ -381,7 +409,7 @@ async def generate_palm_reading(photo_base64_data):
                             {"type": "image_url", "image_url": {"url": photo_url, "detail": "auto"}}
                         ]}
                     ],
-                    max_tokens=1500,
+                    max_tokens=1000,
                     temperature=0.7
                 )
             )
@@ -395,69 +423,48 @@ async def generate_palm_reading(photo_base64_data):
 
 
 
-async def generate_compatibility_reading(name1: str, name2: str) -> str:
-    tarot_cards = [
-        "0. Шут", "I. Маг", "II. Верховная Жрица", "III. Императрица", "IV. Император",
-        "V. Иерофант", "VI. Влюблённые", "VII. Колесница", "VIII. Сила", "IX. Отшельник",
-        "X. Колесо Фортуны", "XI. Справедливость", "XII. Повешенный", "XIII. Смерть",
-        "XIV. Умеренность", "XV. Дьявол", "XVI. Башня", "XVII. Звезда", "XVIII. Луна",
-        "XIX. Солнце", "XX. Суд", "XXI. Мир"
-    ]
-    selected_cards = random.sample(tarot_cards, 3)
-    card_union = selected_cards[0]
-    card_challenges = selected_cards[1]
-    card_future = selected_cards[2]
+async def generate_compatibility_reading(name1: str, name2: str):
+    selected_cards = random.sample(TAROT_CARDS, 3)
+    card_union = selected_cards[0]['name']
+    card_challenges = selected_cards[1]['name']
+    card_future = selected_cards[2]['name']
 
-    prompt = f"""Ты профессиональный таролог с 15-летним опытом в области отношений. Дай подробный, честный и тёплый расклад на совместимость пары.
+    prompt = f"""Ты таролог. Отвечай строго в JSON без markdown-блоков.
 
-Имена партнёров:
-— Первый: {name1}
-— Второй: {name2}
+Пара: {name1} и {name2}
+Карты: Союз — {card_union}, Испытания — {card_challenges}, Будущее — {card_future}
 
-Для расклада выпали следующие карты:
-- Союз / основа отношений: {card_union}
-- Испытания / что мешает: {card_challenges}
-- Будущее пары: {card_future}
+Верни ровно такой JSON (не более 130 слов в каждом поле):
+{{
+  "intro": "💑 Энергия пары {name1} и {name2}\\n<3-4 предложения: какая общая энергетика у этого союза, что притягивает этих двоих друг к другу, какое взаимодействие между ними>",
+  "union": "🃏 Союз — {card_union}\\n<что объединяет {name1} и {name2}, их сильные стороны как пары, что они дают друг другу>",
+  "challenges": "🃏 Испытания — {card_challenges}\\n<конкретные трудности и противоречия, о чём важно поговорить, что мешает гармонии>",
+  "future": "🃏 Будущее — {card_future}\\n<куда движутся отношения, при каких условиях они расцветут, чего стоит избегать>",
+  "advice": "💡 Советы для {name1} и {name2}\\n<4-5 конкретных советов с объяснением>\\n\\n🌟 Итог\\n<тёплое и честное заключение об этом союзе>"
+}}
 
-Форматируй ответ так:
-
-💑 Энергия пары {name1} и {name2}
-(Общая характеристика союза — какая энергия объединяет этих людей, насколько они совместимы на глубинном уровне)
-
-🃏 Послание карт
-
-— Союз ({card_union}):
-(Что объединяет эту пару, их общие сильные стороны, почему они притягиваются)
-
-— Испытания ({card_challenges}):
-(Конкретные трудности и противоречия, о чём важно поговорить)
-
-— Будущее ({card_future}):
-(Куда движутся отношения, при каких условиях пара расцветёт)
-
-💡 Советы для гармонии
-(5 конкретных практических советов — что {name1} и {name2} могут сделать уже сейчас)
-
-🌟 Итог
-(Тёплое и честное заключение об этой паре — их потенциал, главный посыл карт)
-
-Требования:
-- Обращайся к партнёрам по именам на протяжении всего текста
-- На русском языке
-- Атмосфера тёплая, но честная
-- Только конкретные наблюдения, никаких общих фраз"""
+Обращайся по именам {name1} и {name2}. На русском. Атмосфера тёплая, но честная, без лишних прикрас."""
 
     response = await asyncio.to_thread(
         openai_client.chat.completions.create,
         model=OPENAI_MODEL,
         messages=[
-            {"role": "system", "content": "Ты профессиональный таролог, специализирующийся на отношениях. Даёшь детальные, тёплые и конкретные расклады на совместимость пар на русском языке."},
+            {"role": "system", "content": "Ты таролог по отношениям. Отвечай ТОЛЬКО в JSON формате без markdown-блоков и без лишнего текста."},
             {"role": "user", "content": prompt}
         ],
         max_tokens=1500,
         temperature=0.7
     )
-    return response.choices[0].message.content
+    raw = response.choices[0].message.content.strip()
+    start, end = raw.find('{'), raw.rfind('}')
+    if start != -1 and end > start:
+        try:
+            sections = json.loads(raw[start:end + 1])
+        except json.JSONDecodeError:
+            sections = {"full": raw}
+    else:
+        sections = {"full": raw}
+    return sections, selected_cards
 
 
 @dp.callback_query(F.data == "compatibility")
@@ -486,7 +493,8 @@ async def confirm_compatibility(callback: types.CallbackQuery, state: FSMContext
     db = SessionLocal()
     cost = get_compatibility_reading_cost(db)
     user = get_or_create_user(db, callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
-    if not is_admin(callback.from_user.id) and user.balance < cost:
+    admin = is_admin(callback.from_user.id) and get_demo_balance(db)
+    if not admin and user.balance < cost:
         await callback.message.edit_text(
             f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> <b>Недостаточно средств.</b>\n"
             f"Стоимость: <b>{cost:.0f} руб.</b>\n"
@@ -522,7 +530,7 @@ async def compat_name2(message: types.Message, state: FSMContext):
     db = SessionLocal()
     cost = get_compatibility_reading_cost(db)
     user = get_or_create_user(db, message.from_user.id, message.from_user.username, message.from_user.first_name)
-    admin = is_admin(message.from_user.id)
+    admin = is_admin(message.from_user.id) and get_demo_balance(db)
 
     if not admin and user.balance < cost:
         await message.answer(
@@ -556,20 +564,37 @@ async def compat_name2(message: types.Message, state: FSMContext):
     db.commit()
     db.refresh(reading)
     reading_id = reading.id
+    await send_log(
+        f"💑 <b>Совместимость пары</b>\n"
+        f"👤 {fmt_user(user.first_name, user.username, user.telegram_id)}\n"
+        f"👫 Пара: <b>{name1}</b> и <b>{name2}</b>\n"
+        f"💰 Стоимость: <b>{'бесплатно (демо-режим)' if admin else f'{cost:.0f} руб.'}</b>\n"
+        f"🆔 Расклад №{reading_id}\n"
+        f"⏰ {fmt_time()}"
+    )
     db.close()
     await state.clear()
 
     progress_msg = await message.answer("❤️ Раскладываем карты для вашей пары...")
     try:
-        response = await generate_compatibility_reading(name1, name2)
+        sections, selected_cards = await generate_compatibility_reading(name1, name2)
 
         db = SessionLocal()
         r = db.query(Reading).filter(Reading.id == reading_id).first()
-        r.response = response
+        r.response = json.dumps(sections, ensure_ascii=False)
         db.commit()
         db.close()
 
-        await progress_msg.edit_text(f"✨ Расклад готов!\n\n{response}", reply_markup=back_to_menu_keyboard())
+        if "full" in sections:
+            for card in selected_cards:
+                await send_card_photo_safe(message.chat.id, card, f"🃏 {card['name']}")
+            await progress_msg.edit_text(f"✨ Расклад готов!\n\n{sections['full']}", reply_markup=back_to_menu_keyboard())
+        else:
+            await progress_msg.edit_text(sections.get("intro", "❤️ Расклад..."))
+            for i, key in enumerate(["union", "challenges", "future"]):
+                section_text = sections.get(key, "")
+                await send_card_photo_safe(message.chat.id, selected_cards[i], section_text)
+            await message.answer(sections.get("advice", ""), reply_markup=back_to_menu_keyboard())
     except Exception as e:
         logger.error(f"Compatibility reading error: {e}")
         await progress_msg.edit_text(
@@ -610,7 +635,7 @@ async def help_command(message: types.Message):
            "3. Нажмите 'Подтвердить оплату'\n" \
            "4. После подтверждения администратором средства поступят на ваш баланс\n" \
            "5. Сделайте расклад таро через меню 'Сделать расклад таро'\n\n" \
-           "Если есть вопросы — напишите тех. поддержке: @augrudhs"
+           "Если есть вопросы — напишите тех. поддержке: @mg_maria_tarolog"
     
     await message.answer(text, reply_markup=back_to_menu_keyboard())
 
@@ -688,15 +713,18 @@ async def daily_card(callback: types.CallbackQuery):
     ]
     
     if photo_url:
+        card_obj = {"image_url": photo_url, "name": card.get("name", "")}
+        sent = False
         try:
-            await bot.send_photo(
-                chat_id=callback.from_user.id,
-                photo=photo_url,
-                caption=text,
+            await send_card_photo_safe(
+                callback.from_user.id, card_obj, text[:1024],
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
             )
+            sent = True
             await callback.message.delete()
         except Exception:
+            pass
+        if not sent:
             await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     else:
         await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
@@ -716,7 +744,7 @@ async def help_callback(callback: types.CallbackQuery):
            "3. Нажмите 'Подтвердить оплату'\n" \
            "4. После подтверждения администратором средства поступят на ваш баланс\n" \
            "5. Сделайте расклад таро через меню 'Сделать расклад таро'\n\n" \
-           "Если есть вопросы — напишите тех. поддержке: @augrudhs"
+           "Если есть вопросы — напишите тех. поддержке: @mg_maria_tarolog"
     
     await callback.message.edit_text(text, reply_markup=back_to_menu_keyboard())
 
@@ -760,84 +788,78 @@ async def topup_callback(callback: types.CallbackQuery):
            "Выберите сумму пополнения:"
     await callback.message.edit_text(text, reply_markup=topup_amounts_keyboard())
 
+async def _start_yookassa_topup(amount: float, telegram_id: int, username, first_name, edit_func):
+    db = SessionLocal()
+    try:
+        user = get_or_create_user(db, telegram_id, username, first_name)
+        topup_request = TopupRequest(user_id=user.id, amount=amount, is_approved=False, is_rejected=False)
+        db.add(topup_request)
+        db.commit()
+        db.refresh(topup_request)
+        payment_result = await create_yookassa_payment(amount, topup_request.id, user.id)
+        if payment_result["success"]:
+            topup_request.robokassa_payment_id = payment_result["payment_id"]
+            db.commit()
+            await send_log(
+                f"💳 <b>Создан платёж ЮKassa</b>\n"
+                f"👤 {fmt_user(first_name, username, telegram_id)}\n"
+                f"💰 Сумма: <b>{amount:.2f} руб.</b>\n"
+                f"🆔 Payment ID: <code>{payment_result['payment_id']}</code>\n"
+                f"⏰ {fmt_time()}"
+            )
+            keyboard = [
+                [InlineKeyboardButton(text="Оплатить через ЮKassa", icon_custom_emoji_id="5769126056262898415", style="success", url=payment_result["payment_url"])],
+                [InlineKeyboardButton(text="Проверить оплату", icon_custom_emoji_id="5774022692642492953", style="primary", callback_data=f"check_yookassa_{topup_request.id}")],
+                [main_menu_button()]
+            ]
+            text = (f"💵 Пополнение на {amount:.2f} руб.\n\n"
+                    "Нажмите кнопку ниже для оплаты через ЮKassa.\n"
+                    "После оплаты нажмите «Проверить оплату».")
+            await edit_func(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        else:
+            await edit_func(
+                "<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Ошибка создания платежа: " + payment_result["error"],
+                reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
+            )
+    except Exception as e:
+        logger.error(f"Error creating YooKassa topup: {e}")
+        await edit_func(
+            "<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Ошибка. Попробуйте позже.",
+            reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
+        )
+    finally:
+        db.close()
+
 @dp.callback_query(F.data.startswith("topup_amount_"))
 async def select_topup_amount(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     amount = float(callback.data.split("_")[2])
-    await state.update_data(topup_amount=amount)
-    await state.set_state(States.TOPUP_METHOD)
-    
-    keyboard = [
-        [InlineKeyboardButton(text="💳 Оплатить через ЮKassa", style="success", callback_data="payment_method_yookassa")],
-        [InlineKeyboardButton(text="Перевод на карту (вручную)", icon_custom_emoji_id="6028171274939797252", style="success", callback_data="payment_method_manual")],
-        [main_menu_button()]
-    ]
-    
-    text = f"💵 Пополнение на {amount:.2f} руб.\n\n" \
-           "Выберите способ оплаты:"
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await state.clear()
+    await _start_yookassa_topup(amount, callback.from_user.id, callback.from_user.username, callback.from_user.first_name, callback.message.edit_text)
 
-
-
-@dp.callback_query(F.data.startswith("payment_method_"))
-async def select_payment_method(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "topup_custom_amount")
+async def topup_custom_amount_callback(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    method = callback.data.split("_")[2]
-    data = await state.get_data()
-    amount = data.get("topup_amount")
-    
-    db = SessionLocal()
+    await state.set_state(States.TOPUP_AMOUNT)
+    await callback.message.edit_text("✍️ Введите сумму пополнения (в рублях):", reply_markup=back_to_menu_keyboard())
+
+@dp.message(States.TOPUP_AMOUNT)
+async def handle_custom_topup_amount(message: types.Message, state: FSMContext):
+    text = message.text.strip().replace(',', '.') if message.text else ""
     try:
-        user = get_or_create_user(db, callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
-        
-        topup_request = TopupRequest(
-            user_id=user.id,
-            amount=amount,
-            is_approved=False,
-            is_rejected=False
-        )
-        db.add(topup_request)
-        db.commit()
-        db.refresh(topup_request)
-        await state.update_data(topup_request_id=topup_request.id)
-        
-        if method == "yookassa":
-            payment_result = await create_yookassa_payment(amount, topup_request.id, user.id)
-            if payment_result["success"]:
-                topup_request.robokassa_payment_id = payment_result["payment_id"]
-                db.commit()
-                keyboard = [
-                    [InlineKeyboardButton(text="💳 Оплатить через ЮKassa", style="success", url=payment_result["payment_url"])],
-                    [InlineKeyboardButton(text="Проверить оплату", icon_custom_emoji_id="5774022692642492953", style="primary", callback_data=f"check_yookassa_{topup_request.id}")],
-                    [main_menu_button()]
-                ]
-                text = f"💵 Пополнение на {amount:.2f} руб.\n\n" \
-                       "Нажмите кнопку ниже для оплаты через ЮMoney.\n" \
-                       "После оплаты нажмите «Проверить оплату»."
-                await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
-            else:
-                await callback.message.edit_text("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Ошибка создания платежа: " + payment_result["error"], reply_markup=back_to_menu_keyboard(), parse_mode="HTML")
-                await state.clear()
-        elif method == "manual":
-            await state.update_data(topup_amount=amount, topup_request_id=topup_request.id)
-            keyboard = [
-                [InlineKeyboardButton(text="Открыть банк", icon_custom_emoji_id="6028171274939797252", style="success", url="https://t.tb.ru/c2c-qr-choose-bank?requisiteNumber=+79213385912&bankCode=100000000004")],
-                [InlineKeyboardButton(text="Подтвердить оплату", icon_custom_emoji_id="5774022692642492953", style="success", callback_data="confirm_payment")],
-            ]
-            text = f"💵 Пополнение на {amount:.2f} руб.\n\n" \
-                   "После перевода нажмите кнопку ниже:"
-            await callback.message.edit_text(text, reply_markup=with_menu_button(keyboard))
-            
-    except Exception as e:
-        logger.error(f"Error in select_payment_method: {e}")
-        await callback.answer("❌ Произошла ошибка.", show_alert=True)
-    finally:
-        db.close()
+        amount = float(text)
+    except ValueError:
+        await message.answer('<tg-emoji emoji-id="5774077015388852135">❌</tg-emoji> Введите сумму числом, например: 350', reply_markup=back_to_menu_keyboard(), parse_mode="HTML")
+        return
+    if amount < 10:
+        await message.answer('<tg-emoji emoji-id="5774077015388852135">❌</tg-emoji> Минимальная сумма: 10 руб.', reply_markup=back_to_menu_keyboard(), parse_mode="HTML")
+        return
+    await state.clear()
+    await _start_yookassa_topup(amount, message.from_user.id, message.from_user.username, message.from_user.first_name, message.answer)
 
 
 @dp.callback_query(F.data.startswith("check_yookassa_"))
 async def check_yookassa_payment_callback(callback: types.CallbackQuery):
-    await callback.answer()
     try:
         request_id = int(callback.data.split("_")[2])
     except (IndexError, ValueError):
@@ -854,35 +876,46 @@ async def check_yookassa_payment_callback(callback: types.CallbackQuery):
 
         if topup_request.is_approved:
             await callback.answer("✅ Оплата уже подтверждена!", show_alert=True)
-            await callback.message.edit_text("<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Оплата уже подтверждена!", reply_markup=back_to_menu_keyboard(), parse_mode="HTML")
+            await callback.message.edit_text(
+                "<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Оплата уже подтверждена!",
+                reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
+            )
             return
 
         if topup_request.is_rejected:
             await callback.answer("❌ Запрос отклонён.", show_alert=True)
-            await callback.message.edit_text("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Запрос отклонён.", reply_markup=back_to_menu_keyboard(), parse_mode="HTML")
+            await callback.message.edit_text(
+                "<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Запрос отклонён.",
+                reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
+            )
             return
 
         if not topup_request.robokassa_payment_id:
             await callback.answer("❌ Нет данных о платеже.", show_alert=True)
             return
 
+        # Acknowledge the callback before the async API call
+        await callback.answer()
+
         check_result = await check_yookassa_payment(topup_request.robokassa_payment_id)
 
         if not check_result["success"]:
-            await callback.answer(f"❌ Ошибка проверки: {check_result.get('error')}", show_alert=True)
+            await callback.message.edit_text(
+                f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Ошибка проверки платежа. Попробуйте позже.",
+                reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
+            )
             return
 
         if check_result.get("paid"):
             user = db.query(User).filter(User.id == topup_request.user_id).first()
             user.balance += topup_request.amount
 
-            transaction = Transaction(
+            db.add(Transaction(
                 user_id=user.id,
                 amount=topup_request.amount,
                 type="topup",
                 description=f"Пополнение баланса через ЮKassa ({topup_request.amount} руб.)"
-            )
-            db.add(transaction)
+            ))
 
             topup_request.is_approved = True
             topup_request.approved_at = datetime.now(pytz.UTC)
@@ -891,11 +924,18 @@ async def check_yookassa_payment_callback(callback: types.CallbackQuery):
             await callback.message.edit_text(
                 f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Оплата успешна! Ваш баланс пополнен на {topup_request.amount:.2f} руб.\n"
                 f"Текущий баланс: {user.balance:.2f} руб.",
-                reply_markup=back_to_menu_keyboard(),
-                parse_mode="HTML"
+                reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
             )
 
             logger.info(f"YooKassa payment {topup_request.robokassa_payment_id} approved: {topup_request.amount} RUB for user {user.telegram_id}")
+            await send_log(
+                f"✅ <b>Пополнение через ЮKassa подтверждено</b>\n"
+                f"👤 {fmt_user(user.first_name, user.username, user.telegram_id)}\n"
+                f"💰 Сумма: <b>{topup_request.amount:.2f} руб.</b>\n"
+                f"💼 Баланс после: <b>{user.balance:.2f} руб.</b>\n"
+                f"🆔 Payment ID: <code>{topup_request.robokassa_payment_id}</code>\n"
+                f"⏰ {fmt_time()}"
+            )
 
             for admin_id in ADMIN_USER_IDS:
                 try:
@@ -907,279 +947,29 @@ async def check_yookassa_payment_callback(callback: types.CallbackQuery):
                              f"Сумма: {topup_request.amount:.2f} руб.",
                         parse_mode="HTML"
                     )
-                except Exception as e:
-                    logger.error(f"Failed to send admin notification: {e}")
+                except Exception:
+                    pass
         else:
-            await callback.answer("⌛ Оплата ещё не выполнена. Попробуйте позже.", show_alert=True)
+            retry_keyboard = [
+                [InlineKeyboardButton(icon_custom_emoji_id="5775896410780079073", text="Проверить ещё раз", style="primary", callback_data=f"check_yookassa_{request_id}")],
+                [main_menu_button()]
+            ]
+            await callback.message.edit_text(
+                "<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Оплата не прошла.\n\n"
+                "Если вы уже оплатили — подождите немного и нажмите «Проверить ещё раз».",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=retry_keyboard),
+                parse_mode="HTML"
+            )
 
     except Exception as e:
         logger.error(f"Error in check_yookassa_payment_callback: {e}")
-        await callback.answer("❌ Произошла ошибка. Попробуйте позже.", show_alert=True)
-    finally:
-        db.close()
-
-
-@dp.callback_query(F.data == "confirm_payment")
-async def confirm_payment(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer()
-    data = await state.get_data()
-    amount = data.get('topup_amount')
-    request_id = data.get('topup_request_id')
-    
-    if not amount or not request_id:
-        await callback.answer("❌ Произошла ошибка. Попробуйте снова.", show_alert=True)
-        await callback.message.edit_text("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Произошла ошибка. Попробуйте снова.", reply_markup=back_to_menu_keyboard(), parse_mode="HTML")
-        return
-    
-    db = SessionLocal()
-    try:
-        user = get_or_create_user(db, callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
-        
-        topup_request = db.query(TopupRequest).filter(TopupRequest.id == request_id).first()
-        if not topup_request:
-            await callback.answer("❌ Запрос не найден.", show_alert=True)
-            return
-        
-        logger.info(f"Notifying {len(ADMIN_USER_IDS)} admins about topup request {request_id}")
-        for admin_id in ADMIN_USER_IDS:
-            try:
-                keyboard = [
-                    [InlineKeyboardButton(text=f"Подтвердить {amount:.2f} руб.", icon_custom_emoji_id="5774022692642492953", style="success", callback_data=f"approve_{request_id}")],
-                    [InlineKeyboardButton(text=f"Отклонить", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data=f"reject_{request_id}")],
-                ]
-                
-                await bot.send_message(
-                    chat_id=admin_id,
-                    text=f"📨 Новый запрос на пополнение!\n\n"
-                         f"ID запроса: {request_id}\n"
-                         f"Пользователь: {user.first_name or 'Unknown'} (@{user.username or 'no_username'})\n"
-                         f"Сумма: {amount:.2f} руб.\n"
-                         f"Дата: {datetime.now(pytz.UTC).strftime('%d.%m.%Y %H:%M:%S')}",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-                )
-                logger.info(f"Topup notification sent to admin {admin_id}")
-            except Exception as e:
-                logger.error(f"Failed to send topup notification to admin {admin_id}: {str(e)}")
-        
-        await callback.message.edit_text(
-            "<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Запрос отправлен администраторам на проверку.\n"
-            "После подтверждения баланс будет пополнен.",
-            reply_markup=back_to_menu_keyboard()
-        , parse_mode="HTML")
-        
-    except Exception as e:
-        pass
-        await callback.answer("❌ Произошла ошибка. Попробуйте позже.", show_alert=True)
-    finally:
-        db.close()
-
-@dp.callback_query(F.data == "approve_all")
-async def approve_all_payments(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ У вас нет прав для выполнения этого действия.", show_alert=True)
-        return
-    
-    await callback.answer()
-    db = SessionLocal()
-    try:
-        pending_requests = db.query(TopupRequest).filter(
-            TopupRequest.is_approved == False,
-            TopupRequest.is_rejected == False
-        ).all()
-        
-        if not pending_requests:
-            await callback.message.edit_text("<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Нет ожидающих запросов на пополнение.", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
-            db.close()
-            return
-        
-        count = 0
-        for req in pending_requests:
-            user = db.query(User).filter(User.id == req.user_id).first()
-            user.balance += req.amount
-            
-            transaction = Transaction(
-                user_id=user.id,
-                amount=req.amount,
-                type='topup',
-                description=f'Пополнение баланса через админ (все) ({req.amount} руб.)'
-            )
-            db.add(transaction)
-            
-            req.is_approved = True
-            req.approved_at = datetime.now(pytz.UTC)
-            count += 1
-            
-            try:
-                await bot.send_message(
-                    chat_id=user.telegram_id,
-                    text=f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Ваш баланс успешно пополнен на {req.amount:.2f} руб.!\n"
-                         f"Текущий баланс: {user.balance:.2f} руб."
-                , parse_mode="HTML")
-            except Exception as e:
-                pass
-        
-        db.commit()
-        logger.info(f"Approved {count} topup requests")
-        
-        await callback.message.edit_text(f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Успешно одобрено {count} заявок!", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
-        
-    except Exception as e:
-        await callback.answer("❌ Произошла ошибка.", show_alert=True)
-        db.rollback()
-    finally:
-        db.close()
-
-@dp.callback_query(F.data == "reject_all")
-async def reject_all_payments(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ У вас нет прав для выполнения этого действия.", show_alert=True)
-        return
-    
-    await callback.answer()
-    db = SessionLocal()
-    try:
-        pending_requests = db.query(TopupRequest).filter(
-            TopupRequest.is_approved == False,
-            TopupRequest.is_rejected == False
-        ).all()
-        
-        if not pending_requests:
-            await callback.message.edit_text("<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Нет ожидающих запросов на пополнение.", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
-            db.close()
-            return
-        
-        count = 0
-        for req in pending_requests:
-            req.is_rejected = True
-            count += 1
-            
-            user = db.query(User).filter(User.id == req.user_id).first()
-            try:
-                await bot.send_message(
-                    chat_id=user.telegram_id,
-                    text=f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Ваш запрос на пополнение на {req.amount:.2f} руб. был отклонён."
-                , parse_mode="HTML")
-            except Exception as e:
-                pass
-        
-        db.commit()
-        logger.info(f"Rejected {count} topup requests")
-        
-        await callback.message.edit_text(f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Успешно отклонено {count} заявок!", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
-        
-    except Exception as e:
-        await callback.answer("❌ Произошла ошибка.", show_alert=True)
-        db.rollback()
-    finally:
-        db.close()
-
-@dp.callback_query(F.data.startswith("approve_"))
-async def approve_payment(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ У вас нет прав для выполнения этого действия.", show_alert=True)
-        return
-    
-    await callback.answer()
-    try:
-        request_id = int(callback.data.split("_")[1])
-    except (IndexError, ValueError):
-        await callback.answer("❌ Неверный формат.", show_alert=True)
-        return
-    
-    db = SessionLocal()
-    try:
-        topup_request = db.query(TopupRequest).filter(TopupRequest.id == request_id).first()
-        if not topup_request:
-            await callback.answer("❌ Запрос не найден.", show_alert=True)
-            return
-        
-        if topup_request.is_approved or topup_request.is_rejected:
-            await callback.answer("❌ Этот запрос уже обработан.", show_alert=True)
-            return
-        
-        user = db.query(User).filter(User.id == topup_request.user_id).first()
-        user.balance += topup_request.amount
-        
-        transaction = Transaction(
-            user_id=user.id,
-            amount=topup_request.amount,
-            type='topup',
-            description=f'Пополнение баланса через админ ({topup_request.amount} руб.)'
-        )
-        db.add(transaction)
-        
-        topup_request.is_approved = True
-        topup_request.approved_at = datetime.now(pytz.UTC)
-        db.commit()
-        logger.info(f"Topup request {request_id} approved: {topup_request.amount} RUB for user {user.telegram_id}")
-        
         try:
-            await bot.send_message(
-                chat_id=user.telegram_id,
-                text=f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Ваш баланс успешно пополнен на {topup_request.amount:.2f} руб.!\n"
-                     f"Текущий баланс: {user.balance:.2f} руб."
-            , parse_mode="HTML")
-        except Exception as e:
+            await callback.answer("❌ Произошла ошибка. Попробуйте позже.", show_alert=True)
+        except Exception:
             pass
-        
-        await callback.message.edit_text(
-            f"<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Запрос {request_id} подтверждён!\n"
-            f"Пользователь: {user.first_name or 'Unknown'}\n"
-            f"Сумма: {topup_request.amount:.2f} руб.",
-            reply_markup=admin_menu_keyboard()
-        , parse_mode="HTML")
-        
-    except Exception as e:
-        await callback.answer("❌ Произошла ошибка.", show_alert=True)
     finally:
         db.close()
 
-@dp.callback_query(F.data.startswith("reject_"))
-async def reject_payment(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ У вас нет прав для выполнения этого действия.", show_alert=True)
-        return
-    
-    await callback.answer()
-    try:
-        request_id = int(callback.data.split("_")[1])
-    except (IndexError, ValueError):
-        await callback.answer("❌ Неверный формат.", show_alert=True)
-        return
-    
-    db = SessionLocal()
-    try:
-        topup_request = db.query(TopupRequest).filter(TopupRequest.id == request_id).first()
-        if not topup_request:
-            await callback.answer("❌ Запрос не найден.", show_alert=True)
-            return
-        
-        if topup_request.is_approved or topup_request.is_rejected:
-            await callback.answer("❌ Этот запрос уже обработан.", show_alert=True)
-            return
-        
-        topup_request.is_rejected = True
-        db.commit()
-        logger.info(f"Topup request {request_id} rejected for user {topup_request.user_id}")
-        
-        user = db.query(User).filter(User.id == topup_request.user_id).first()
-        try:
-            await bot.send_message(
-                chat_id=user.telegram_id,
-                text="<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Ваш запрос на пополнение баланса был отклонён."
-            , parse_mode="HTML")
-        except Exception as e:
-            pass
-        
-        await callback.message.edit_text(
-            f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Запрос {request_id} отклонён!",
-            reply_markup=admin_menu_keyboard()
-        , parse_mode="HTML")
-        
-    except Exception as e:
-        await callback.answer("❌ Произошла ошибка.", show_alert=True)
-    finally:
-        db.close()
 
 @dp.callback_query(F.data == "start_standard_reading")
 async def start_standard_reading(callback: types.CallbackQuery):
@@ -1244,7 +1034,7 @@ async def question1(message: types.Message, state: FSMContext):
         try:
             file_info = await bot.get_file(message.voice.file_id)
             file_bytes = await bot.download_file(file_info.file_path)
-            question_text = await transcribe_voice(file_bytes)
+            question_text = await transcribe_voice(file_bytes.getvalue())
         except Exception:
             await progress_msg.edit_text(
                 "<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Не удалось распознать голосовое. Попробуйте ещё раз или напишите текстом.",
@@ -1264,7 +1054,7 @@ async def question1(message: types.Message, state: FSMContext):
     cost = get_reading_cost(db)
     user = get_or_create_user(db, message.from_user.id, message.from_user.username, message.from_user.first_name)
 
-    admin = is_admin(message.from_user.id)
+    admin = is_admin(message.from_user.id) and get_demo_balance(db)
 
     if not is_free and not admin and user.balance < cost:
         await progress_msg.edit_text(
@@ -1300,27 +1090,42 @@ async def question1(message: types.Message, state: FSMContext):
     db.commit()
     db.refresh(reading)
     reading_id = reading.id
+    if is_free:
+        cost_label = "бесплатно (первый расклад)"
+    elif admin:
+        cost_label = "бесплатно (демо-режим)"
+    else:
+        cost_label = f"{cost} руб."
+    await send_log(
+        f"🃏 <b>Стандартный расклад</b>\n"
+        f"👤 {fmt_user(user.first_name, user.username, user.telegram_id)}\n"
+        f"💰 Стоимость: <b>{cost_label}</b>\n"
+        f"❓ Вопрос: {question_text[:200]}\n"
+        f"⏰ {fmt_time()}"
+    )
     db.close()
 
     await state.clear()
 
     try:
-        response, selected_cards = await generate_tarot_reading(question_text)
+        sections, selected_cards = await generate_tarot_reading(question_text)
 
         db = SessionLocal()
         r = db.query(Reading).filter(Reading.id == reading_id).first()
-        r.response = response
+        r.response = json.dumps(sections, ensure_ascii=False)
         db.commit()
         db.close()
 
-        card_names = ' · '.join(c['name'] for c in selected_cards)
-        media = [InputMediaPhoto(media=c['image_url']) for c in selected_cards]
-        await bot.send_media_group(chat_id=message.chat.id, media=media)
-
-        await progress_msg.edit_text(
-            f"🃏 <b>Карты расклада:</b> {card_names}\n\n✨ Ваш расклад готов!\n\n{response}",
-            reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
-        )
+        if "full" in sections:
+            for card in selected_cards:
+                await send_card_photo_safe(message.chat.id, card, f"🃏 {card['name']}")
+            await progress_msg.edit_text(f"✨ Ваш расклад готов!\n\n{sections['full']}", reply_markup=back_to_menu_keyboard())
+        else:
+            await progress_msg.edit_text(sections.get("intro", "🔮 Расклад..."))
+            for i, key in enumerate(["past", "present", "future"]):
+                section_text = sections.get(key, "")
+                await send_card_photo_safe(message.chat.id, selected_cards[i], section_text)
+            await message.answer(sections.get("advice", ""), reply_markup=back_to_menu_keyboard())
     except Exception as e:
         logger.error(f"Standard reading error: {e}")
         await progress_msg.edit_text(
@@ -1359,7 +1164,7 @@ async def confirm_individual_reading(callback: types.CallbackQuery, state: FSMCo
     cost = get_individual_reading_cost(db)
     user = get_or_create_user(db, callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
 
-    admin = is_admin(callback.from_user.id)
+    admin = is_admin(callback.from_user.id) and get_demo_balance(db)
     if not admin and user.balance < cost:
         await callback.message.edit_text(
             f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> <b>Недостаточно средств.</b>\n"
@@ -1398,6 +1203,13 @@ async def confirm_individual_reading(callback: types.CallbackQuery, state: FSMCo
     db.refresh(reading)
     reading_id = reading.id
     user_name = user.first_name or user.username or str(user.telegram_id)
+    await send_log(
+        f"🔮 <b>Индивидуальный расклад</b>\n"
+        f"👤 {fmt_user(user.first_name, user.username, user.telegram_id)}\n"
+        f"💰 Стоимость: <b>{'бесплатно (демо-режим)' if admin else f'{cost:.0f} руб.'}</b>\n"
+        f"🆔 Расклад №{reading_id}\n"
+        f"⏰ {fmt_time()}"
+    )
     db.close()
 
     # Уведомляем всех админов
@@ -1547,8 +1359,8 @@ async def handle_palm_photo(message: types.Message, state: FSMContext):
     db = SessionLocal()
     cost = get_palm_reading_cost(db)
     user = get_or_create_user(db, message.from_user.id, message.from_user.username, message.from_user.first_name)
-    
-    admin = is_admin(message.from_user.id)
+
+    admin = is_admin(message.from_user.id) and get_demo_balance(db)
     if not admin and user.balance < cost:
         await message.answer(
             f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Недостаточно средств для расклада.\n"
@@ -1579,6 +1391,13 @@ async def handle_palm_photo(message: types.Message, state: FSMContext):
     db.commit()
     db.refresh(reading)
     reading_id = reading.id
+    await send_log(
+        f"✋ <b>Расклад по ладони</b>\n"
+        f"👤 {fmt_user(user.first_name, user.username, user.telegram_id)}\n"
+        f"💰 Стоимость: <b>{'бесплатно (демо-режим)' if admin else f'{cost:.0f} руб.'}</b>\n"
+        f"🆔 Расклад №{reading_id}\n"
+        f"⏰ {fmt_time()}"
+    )
     db.close()
 
     await state.clear()
@@ -1611,9 +1430,25 @@ async def show_admin_menu(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("❌ У вас нет прав для доступа к админ-панели.", show_alert=True)
         return
-    
+
     await callback.answer()
     await callback.message.edit_text("🔐 Админ-панель:", reply_markup=admin_menu_keyboard())
+
+@dp.callback_query(F.data == "admin_toggle_demo")
+async def admin_toggle_demo_handler(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав.", show_alert=True)
+        return
+    await callback.answer()
+    db = SessionLocal()
+    current = get_demo_balance(db)
+    set_demo_balance(db, not current)
+    db.close()
+    new_state = "включён" if not current else "выключен"
+    await callback.message.edit_text(
+        f"🔐 Админ-панель:\n\nДемо баланс {new_state}.",
+        reply_markup=admin_menu_keyboard()
+    )
 
 @dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: types.CallbackQuery):
@@ -1681,48 +1516,139 @@ async def admin_stats(callback: types.CallbackQuery):
     
     await callback.message.edit_text(text, reply_markup=admin_menu_keyboard(), parse_mode="HTML")
 
-@dp.callback_query(F.data == "admin_requests")
-async def admin_requests(callback: types.CallbackQuery):
+@dp.callback_query(F.data == "admin_balance")
+async def admin_balance(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("❌ У вас нет прав для доступа к админ-панели.", show_alert=True)
+        await callback.answer("❌ Нет прав.", show_alert=True)
         return
-    
     await callback.answer()
-    db = SessionLocal()
-    
-    pending_requests = db.query(TopupRequest).filter(
-        TopupRequest.is_approved == False,
-        TopupRequest.is_rejected == False
-    ).all()
-    
-    if not pending_requests:
-        await callback.message.edit_text("<tg-emoji emoji-id=\"5774022692642492953\">✅</tg-emoji> Нет ожидающих запросов на пополнение.", reply_markup=admin_menu_keyboard(), parse_mode="HTML")
-        db.close()
-        return
-    
-    text = "📋 Запросы на пополнение:\n\n"
-    for req in pending_requests:
-        user = db.query(User).filter(User.id == req.user_id).first()
-        text += f"ID: {req.id}\n"
-        text += f"Пользователь: {user.first_name or 'Unknown'} (@{user.username or 'no_username'})\n"
-        text += f"Сумма: {req.amount:.2f} руб.\n"
-        text += f"Дата: {req.created_at.strftime('%d.%m.%Y %H:%M:%S')}\n\n"
-    
     keyboard = [
-        [
-            InlineKeyboardButton(text="Одобрить все заявки", icon_custom_emoji_id="5774022692642492953", style="success", callback_data="approve_all"),
-            InlineKeyboardButton(text="Отклонить все заявки", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="reject_all")
-        ]
+        [InlineKeyboardButton(text="Пополнить", style="success", callback_data="admin_balance_add")],
+        [InlineKeyboardButton(text="Снять", style="danger", callback_data="admin_balance_sub")],
+        [InlineKeyboardButton(text="« Назад к админ-панели", style="primary", callback_data="admin_menu")],
     ]
-    for req in pending_requests:
-        keyboard.append([
-            InlineKeyboardButton(text=f"Подтвердить {req.id}", icon_custom_emoji_id="5774022692642492953", style="success", callback_data=f"approve_{req.id}"),
-            InlineKeyboardButton(text=f"Отклонить {req.id}", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data=f"reject_{req.id}")
-        ])
-    keyboard.append([InlineKeyboardButton(text="<< Назад к админ-панели", style="primary", callback_data="admin_menu")])
-    
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await callback.message.edit_text(
+        "💼 Изменение баланса\n\nВыберите действие:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+    )
+
+@dp.callback_query(F.data.in_({"admin_balance_add", "admin_balance_sub"}))
+async def admin_balance_action(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав.", show_alert=True)
+        return
+    await callback.answer()
+    op = "add" if callback.data == "admin_balance_add" else "sub"
+    await state.update_data(balance_op=op)
+    await state.set_state(States.BALANCE_USER)
+    action = "пополнения" if op == "add" else "снятия"
+    await callback.message.edit_text(
+        f"💼 Введите @username пользователя для {action} баланса:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", style="danger", callback_data="admin_menu")]])
+    )
+
+@dp.message(States.BALANCE_USER)
+async def admin_balance_user(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    username = message.text.strip().lstrip("@")
+    db = SessionLocal()
+    user = db.query(User).filter(User.username == username).first()
     db.close()
+    if not user:
+        await message.answer(
+            f'<tg-emoji emoji-id="5774077015388852135">❌</tg-emoji> Пользователь @{username} не найден.',
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", style="danger", callback_data="admin_menu")]])
+        )
+        return
+    await state.update_data(balance_username=username, balance_telegram_id=user.telegram_id)
+    await state.set_state(States.BALANCE_AMOUNT)
+    data = await state.get_data()
+    action = "добавить" if data["balance_op"] == "add" else "снять"
+    await message.answer(
+        f"💼 Пользователь: @{username}\nВведите сумму, которую нужно {action}:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", style="danger", callback_data="admin_menu")]])
+    )
+
+@dp.message(States.BALANCE_AMOUNT)
+async def admin_balance_amount(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        amount = float(message.text.strip().replace(",", "."))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer(
+            '<tg-emoji emoji-id="5774077015388852135">❌</tg-emoji> Введите корректную сумму (положительное число).',
+            parse_mode="HTML"
+        )
+        return
+
+    data = await state.get_data()
+    op = data["balance_op"]
+    username = data["balance_username"]
+    telegram_id = data["balance_telegram_id"]
+    await state.clear()
+
+    db = SessionLocal()
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        db.close()
+        await message.answer('<tg-emoji emoji-id="5774077015388852135">❌</tg-emoji> Пользователь не найден.', parse_mode="HTML", reply_markup=admin_menu_keyboard())
+        return
+
+    if op == "add":
+        user.balance += amount
+        desc = f"Пополнение администратором ({amount:.2f} руб.)"
+        tx_amount = amount
+        action_text = f"пополнен на {amount:.2f} руб."
+        log_action = "Пополнение"
+    else:
+        if user.balance < amount:
+            db.close()
+            await message.answer(
+                f'<tg-emoji emoji-id="5774077015388852135">❌</tg-emoji> Недостаточно средств. Баланс: {user.balance:.2f} руб.',
+                parse_mode="HTML"
+            )
+            return
+        user.balance -= amount
+        desc = f"Снятие администратором ({amount:.2f} руб.)"
+        tx_amount = -amount
+        action_text = f"уменьшен на {amount:.2f} руб."
+        log_action = "Снятие"
+
+    db.add(Transaction(user_id=user.id, amount=tx_amount, type="admin_adjust", description=desc))
+    db.commit()
+
+    await send_log(
+        f"💼 <b>{log_action} баланса администратором</b>\n"
+        f"👤 {fmt_user(user.first_name, user.username, user.telegram_id)}\n"
+        f"💰 Сумма: <b>{amount:.2f} руб.</b>\n"
+        f"💼 Баланс после: <b>{user.balance:.2f} руб.</b>\n"
+        f"🛡 Админ: {message.from_user.first_name} [<code>{message.from_user.id}</code>]\n"
+        f"⏰ {fmt_time()}"
+    )
+
+    db.close()
+
+    try:
+        emoji = "5774022692642492953" if op == "add" else "5774077015388852135"
+        await bot.send_message(
+            chat_id=telegram_id,
+            text=f'<tg-emoji emoji-id="{emoji}">{"✅" if op == "add" else "❌"}</tg-emoji> Ваш баланс {action_text}.\nТекущий баланс: {user.balance:.2f} руб.',
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    action_done = "пополнен" if op == "add" else "уменьшен"
+    await message.answer(
+        f'<tg-emoji emoji-id="5774022692642492953">✅</tg-emoji> Баланс @{username} {action_done} на {amount:.2f} руб.\nТекущий баланс: {user.balance:.2f} руб.',
+        parse_mode="HTML",
+        reply_markup=admin_menu_keyboard()
+    )
 
 @dp.callback_query(F.data == "admin_pending_readings")
 async def admin_pending_readings(callback: types.CallbackQuery):
@@ -2186,15 +2112,15 @@ async def send_daily_card():
 
 scheduler = AsyncIOScheduler()
 
+
 async def main():
     from sqlalchemy import func
     migrate_database()
-    
+
     logger.info(f"Loaded ADMIN_USER_IDS: {ADMIN_USER_IDS}")
-    scheduler.add_job(send_daily_card, 'cron', hour=10, minute=0)
+    scheduler.add_job(send_daily_card, 'cron', hour=12, minute=0, timezone=pytz.timezone('Europe/Moscow'))
     scheduler.start()
-    
-    
+
     logger.info("Bot started successfully!")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
