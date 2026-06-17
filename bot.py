@@ -25,7 +25,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    BufferedInputFile
+    BufferedInputFile,
+    InputMediaPhoto
 )
 
 from models import (
@@ -63,10 +64,6 @@ if OPENAI_API_KEY:
 
 class States(StatesGroup):
     QUESTION1 = State()
-    QUESTION2 = State()
-    QUESTION3 = State()
-    QUESTION4 = State()
-    QUESTION5 = State()
     TOPUP_AMOUNT = State()
     TOPUP_METHOD = State()
     BROADCAST = State()
@@ -81,13 +78,7 @@ class States(StatesGroup):
     COMPAT_NAME1 = State()
     COMPAT_NAME2 = State()
 
-QUESTIONS = [
-    "1. Какой основной вопрос вас волнует в данный момент?",
-    "2. Какая область жизни вас интересует больше всего (любовь, карьера, финансы, здоровье, духовное развитие)?",
-    "3. Какие чувства вы сейчас испытываете по этому поводу?",
-    "4. Что бы вы хотели изменить или понять в этой ситуации?",
-    "5. Есть ли какие-то конкретные детали или обстоятельства, которые стоит учитывать?",
-]
+QUESTION = "Какой вопрос вас волнует в данный момент? Опишите ситуацию более детально и кого она касается. Можно записать аудио."
 
 TOPUP_AMOUNTS = [100, 200, 500, 1000, 2000, 5000]
 
@@ -281,73 +272,63 @@ def with_menu_button(keyboard_rows):
     keyboard.append([main_menu_button()])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-async def generate_tarot_reading(questions):
-    await asyncio.sleep(105)
-    
-    tarot_cards = [
-        "0. Шут", "I. Маг", "II. Верховная Жрица", "III. Императрица", "IV. Император", 
-        "V. Иерофант", "VI. Влюблённые", "VII. Колесница", "VIII. Сила", "IX. Отшельник", 
-        "X. Колесо Фортуны", "XI. Справедливость", "XII. Повешенный", "XIII. Смерть", 
-        "XIV. Умеренность", "XV. Дьявол", "XVI. Башня", "XVII. Звезда", "XVIII. Луна", 
-        "XIX. Солнце", "XX. Суд", "XXI. Мир"
-    ]
-    
-    selected_cards = random.sample(tarot_cards, 3)
-    past_card = selected_cards[0]
-    present_card = selected_cards[1]
-    future_card = selected_cards[2]
-    
-    prompt = f"""Ты профессиональный таролог с 10-летним опытом. Твоя задача — дать очень конкретный, детальный расклад. Никаких общих фраз!
+async def transcribe_voice(file_bytes):
+    audio_file = BytesIO(file_bytes.getvalue())
+    audio_file.name = "voice.ogg"
+    response = await asyncio.to_thread(
+        openai_client.audio.transcriptions.create,
+        model="whisper-1",
+        file=audio_file,
+        language="ru"
+    )
+    return response.text
 
-Вот ответы пользователя на 5 вопросов:
-1. Основная ситуация: {questions[0]}
-2. Область жизни: {questions[1]}
-3. Текущие эмоции: {questions[2]}
-4. Что хочет изменить: {questions[3]}
-5. Важные детали: {questions[4]}
+async def generate_tarot_reading(question):
+    selected_cards = random.sample(TAROT_CARDS, 3)
+    past_card = selected_cards[0]['name']
+    present_card = selected_cards[1]['name']
+    future_card = selected_cards[2]['name']
 
-Для расклада выпали следующие карты:
+    prompt = f"""Ты профессиональный таролог с 10-летним опытом. Дай конкретный расклад. Никаких общих фраз! Не более 400 слов.
+
+Вопрос: {question}
+
+Карты:
 - Прошлое: {past_card}
 - Настоящее: {present_card}
 - Будущее: {future_card}
 
-Форматируй ответ так:
+Форматируй ответ:
 
 ✨ Общая ситуация
-(Конкретно оцени, что сейчас происходит, свяжи все ответы вместе, не уклоняйся от темы)
+(Кратко — что сейчас происходит по существу вопроса)
 
 🔮 Сообщение карт
-- Прошлое: {past_card} — (подробно опиши, что значит эта карта именно в контексте их ситуации, укажи на конкретные события/решения из прошлого)
-- Настоящее: {present_card} — (детализируй, что значит эта карта сейчас, что скрыто, что явно, какие конкретные шаги делают или не делают)
-- Будущее: {future_card} — (что именно ждёт впереди, конкретные события, сроки если возможно, как подготовиться)
+- Прошлое: {past_card} — (конкретно что это значит в их ситуации)
+- Настоящее: {present_card} — (что значит сейчас, какие шаги)
+- Будущее: {future_card} — (что ждёт, как подготовиться)
 
 💡 Что делать дальше
-(5-6 очень чётких, практических советов — что сделать уже завтра, с кем поговорить, что изменить в поведении, что написать/позвонить и т.д.)
+(3-4 чётких практических совета)
 
-🌟 Итог и поддержка
-(Конкретная поддержка, что точно получится, если выполнить советы)
+🌟 Итог
+(1-2 предложения поддержки)
 
-Требования:
-- На русском языке
-- Без сложных терминов
-- Без общих фраз ("всё будет хорошо" — заменить на "конкретно что и когда будет")
-- Атмосфера таинственная, но честная и поддерживающая"""
-    
+Требования: на русском, без сложных терминов, без общих фраз, атмосфера таинственная."""
+
     response = await asyncio.to_thread(
         openai_client.chat.completions.create,
         model=OPENAI_MODEL,
         messages=[
-            {"role": "system", "content": "Ты профессиональный таролог, дающий информативные, детальные и поддерживающие толкования раскладов на русском языке."},
+            {"role": "system", "content": "Ты профессиональный таролог, дающий краткие, конкретные и поддерживающие толкования на русском языке."},
             {"role": "user", "content": prompt}
         ],
-        max_tokens=3000,
+        max_tokens=1500,
         temperature=0.7
     )
-    return response.choices[0].message.content
+    return response.choices[0].message.content, selected_cards
 
 async def generate_palm_reading(photo_base64_data):
-    await asyncio.sleep(210)
-    
     photo_url = f"data:image/jpeg;base64,{photo_base64_data}"
     
     prompt = """Ты дружелюбный хиромант с 20-летним опытом. Давай детальный, интересный расклад по фото ладони.
@@ -400,7 +381,7 @@ async def generate_palm_reading(photo_base64_data):
                             {"type": "image_url", "image_url": {"url": photo_url, "detail": "auto"}}
                         ]}
                     ],
-                    max_tokens=3500,
+                    max_tokens=1500,
                     temperature=0.7
                 )
             )
@@ -473,7 +454,7 @@ async def generate_compatibility_reading(name1: str, name2: str) -> str:
             {"role": "system", "content": "Ты профессиональный таролог, специализирующийся на отношениях. Даёшь детальные, тёплые и конкретные расклады на совместимость пар на русском языке."},
             {"role": "user", "content": prompt}
         ],
-        max_tokens=3000,
+        max_tokens=1500,
         temperature=0.7
     )
     return response.choices[0].message.content
@@ -505,7 +486,7 @@ async def confirm_compatibility(callback: types.CallbackQuery, state: FSMContext
     db = SessionLocal()
     cost = get_compatibility_reading_cost(db)
     user = get_or_create_user(db, callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
-    if user.balance < cost:
+    if not is_admin(callback.from_user.id) and user.balance < cost:
         await callback.message.edit_text(
             f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> <b>Недостаточно средств.</b>\n"
             f"Стоимость: <b>{cost:.0f} руб.</b>\n"
@@ -539,25 +520,27 @@ async def compat_name2(message: types.Message, state: FSMContext):
     name2 = message.text.strip()
 
     db = SessionLocal()
-    cost = get_reading_cost(db)
+    cost = get_compatibility_reading_cost(db)
     user = get_or_create_user(db, message.from_user.id, message.from_user.username, message.from_user.first_name)
+    admin = is_admin(message.from_user.id)
 
-    if user.balance < cost:
+    if not admin and user.balance < cost:
         await message.answer(
             f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Недостаточно средств.\nСтоимость: {cost:.0f} руб.\nБаланс: {user.balance:.2f} руб.",
-            reply_markup=back_to_menu_keyboard()
-        , parse_mode="HTML")
+            reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
+        )
         await state.clear()
         db.close()
         return
 
-    user.balance -= cost
-    db.add(Transaction(
-        user_id=user.id,
-        amount=-cost,
-        type='reading',
-        description=f'Совместимость пары ({cost:.0f} руб.)'
-    ))
+    if not admin:
+        user.balance -= cost
+        db.add(Transaction(
+            user_id=user.id,
+            amount=-cost,
+            type='reading',
+            description=f'Совместимость пары ({cost:.0f} руб.)'
+        ))
 
     reading = Reading(
         user_id=user.id,
@@ -566,7 +549,7 @@ async def compat_name2(message: types.Message, state: FSMContext):
         question3=name2,
         question4="",
         question5="",
-        cost=cost,
+        cost=0 if admin else cost,
         reading_type='compatibility'
     )
     db.add(reading)
@@ -578,11 +561,6 @@ async def compat_name2(message: types.Message, state: FSMContext):
 
     progress_msg = await message.answer("❤️ Раскладываем карты для вашей пары...")
     try:
-        await asyncio.sleep(15)
-        await progress_msg.edit_text(f"🔮 Исследуем союз {name1} и {name2}...")
-        await asyncio.sleep(15)
-        await progress_msg.edit_text("🌙 Открываем тайны вашей совместимости...")
-
         response = await generate_compatibility_reading(name1, name2)
 
         db = SessionLocal()
@@ -596,8 +574,8 @@ async def compat_name2(message: types.Message, state: FSMContext):
         logger.error(f"Compatibility reading error: {e}")
         await progress_msg.edit_text(
             "<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Произошла ошибка при генерации расклада. Попробуйте позже.",
-            reply_markup=back_to_menu_keyboard()
-        , parse_mode="HTML")
+            reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
+        )
 
 @dp.message(Command("start"))
 async def start(message: types.Message, state: FSMContext):
@@ -711,13 +689,13 @@ async def daily_card(callback: types.CallbackQuery):
     
     if photo_url:
         try:
-            await callback.message.delete()
             await bot.send_photo(
                 chat_id=callback.from_user.id,
                 photo=photo_url,
                 caption=text,
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
             )
+            await callback.message.delete()
         except Exception:
             await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
     else:
@@ -1235,13 +1213,13 @@ async def confirm_standard_reading(callback: types.CallbackQuery, state: FSMCont
     user = get_or_create_user(db, callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
     
     if not user.has_used_free_reading:
-        await state.update_data(questions=[], is_free=True)
+        await state.update_data(is_free=True)
         await state.set_state(States.QUESTION1)
         db.close()
-        await callback.message.edit_text(QUESTIONS[0], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
+        await callback.message.edit_text(QUESTION, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
         return
-    
-    if user.balance < cost:
+
+    if not is_admin(callback.from_user.id) and user.balance < cost:
         await callback.message.edit_text(
             f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Недостаточно средств для расклада.\n"
             f"Стоимость расклада: {cost:.2f} руб.\n"
@@ -1250,123 +1228,105 @@ async def confirm_standard_reading(callback: types.CallbackQuery, state: FSMCont
         , parse_mode="HTML")
         db.close()
         return
-    
-    await state.update_data(questions=[], is_free=False)
+
+    await state.update_data(is_free=False)
     await state.set_state(States.QUESTION1)
     db.close()
-    await callback.message.edit_text(QUESTIONS[0], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
+    await callback.message.edit_text(QUESTION, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
 
 @dp.message(States.QUESTION1)
 async def question1(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    questions = data.get('questions', [])
-    questions.append(message.text)
-    await state.update_data(questions=questions)
-    await state.set_state(States.QUESTION2)
-    await message.answer(QUESTIONS[1], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
-
-@dp.message(States.QUESTION2)
-async def question2(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    questions = data.get('questions', [])
-    questions.append(message.text)
-    await state.update_data(questions=questions)
-    await state.set_state(States.QUESTION3)
-    await message.answer(QUESTIONS[2], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
-
-@dp.message(States.QUESTION3)
-async def question3(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    questions = data.get('questions', [])
-    questions.append(message.text)
-    await state.update_data(questions=questions)
-    await state.set_state(States.QUESTION4)
-    await message.answer(QUESTIONS[3], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
-
-@dp.message(States.QUESTION4)
-async def question4(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    questions = data.get('questions', [])
-    questions.append(message.text)
-    await state.update_data(questions=questions)
-    await state.set_state(States.QUESTION5)
-    await message.answer(QUESTIONS[4], reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
-
-@dp.message(States.QUESTION5)
-async def question5(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    questions = data.get('questions', [])
     is_free = data.get('is_free', False)
-    questions.append(message.text)
-    
+
+    if message.voice:
+        progress_msg = await message.answer("🎙 Распознаём голосовое сообщение...")
+        try:
+            file_info = await bot.get_file(message.voice.file_id)
+            file_bytes = await bot.download_file(file_info.file_path)
+            question_text = await transcribe_voice(file_bytes)
+        except Exception:
+            await progress_msg.edit_text(
+                "<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Не удалось распознать голосовое. Попробуйте ещё раз или напишите текстом.",
+                reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
+            )
+            await state.clear()
+            return
+        await progress_msg.edit_text("🔮 Составляем расклад...")
+    elif message.text:
+        question_text = message.text
+        progress_msg = await message.answer("🔮 Составляем расклад...")
+    else:
+        await message.answer("Пожалуйста, отправьте текст или голосовое сообщение.")
+        return
+
     db = SessionLocal()
     cost = get_reading_cost(db)
     user = get_or_create_user(db, message.from_user.id, message.from_user.username, message.from_user.first_name)
-    
-    if not is_free and user.balance < cost:
-        await message.answer(
+
+    admin = is_admin(message.from_user.id)
+
+    if not is_free and not admin and user.balance < cost:
+        await progress_msg.edit_text(
             f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Недостаточно средств для расклада.\n"
             f"Стоимость расклада: {cost:.2f} руб.\n"
             f"Пополните баланс, используя кнопку '💰 Баланс'.",
-            reply_markup=back_to_menu_keyboard()
-        , parse_mode="HTML")
+            reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
+        )
         await state.clear()
         db.close()
         return
-    
-    if not is_free:
+
+    if not is_free and not admin:
         user.balance -= cost
-        transaction = Transaction(
+        db.add(Transaction(
             user_id=user.id,
             amount=-cost,
             type='reading',
             description=f'Стандартный расклад ({cost} руб.)'
-        )
-        db.add(transaction)
-    
+        ))
+
     if is_free:
         user.has_used_free_reading = True
-    
+
     reading = Reading(
         user_id=user.id,
-        question1=questions[0],
-        question2=questions[1],
-        question3=questions[2],
-        question4=questions[3],
-        question5=questions[4],
-        cost=0 if is_free else cost,
+        question1=question_text,
+        question2="", question3="", question4="", question5="",
+        cost=0 if (is_free or admin) else cost,
         reading_type='standard'
     )
     db.add(reading)
     db.commit()
     db.refresh(reading)
+    reading_id = reading.id
     db.close()
-    
+
     await state.clear()
-    progress_msg = await message.answer("🔮 Раскладываем карты на тёмном полотне...")
-    
+
     try:
-        await asyncio.sleep(30)
-        await progress_msg.edit_text("✨ Смотрим в прошлое...")
-        await asyncio.sleep(30)
-        await progress_msg.edit_text("🌿 Исследуем настоящее...")
-        await asyncio.sleep(30)
-        await progress_msg.edit_text("🔮 Открываем завесу будущего...")
-        
-        response = await generate_tarot_reading(questions)
-        
+        response, selected_cards = await generate_tarot_reading(question_text)
+
         db = SessionLocal()
-        reading = db.query(Reading).filter(Reading.id == reading.id).first()
-        reading.response = response
+        r = db.query(Reading).filter(Reading.id == reading_id).first()
+        r.response = response
         db.commit()
         db.close()
-        
-        await progress_msg.edit_text(f"✨ Ваш расклад готов!\n\n{response}", reply_markup=back_to_menu_keyboard())
+
+        card_names = ' · '.join(c['name'] for c in selected_cards)
+        media = [InputMediaPhoto(media=c['image_url']) for c in selected_cards]
+        await bot.send_media_group(chat_id=message.chat.id, media=media)
+
+        await progress_msg.edit_text(
+            f"🃏 <b>Карты расклада:</b> {card_names}\n\n✨ Ваш расклад готов!\n\n{response}",
+            reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
+        )
     except Exception as e:
+        logger.error(f"Standard reading error: {e}")
         await progress_msg.edit_text(
             "<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Произошла ошибка при генерации расклада. Попробуйте позже.",
-            reply_markup=back_to_menu_keyboard()
-        , parse_mode="HTML")
+            reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
+        )
 
 @dp.callback_query(F.data == "individual_reading")
 @dp.callback_query(F.data == "start_individual_reading")
@@ -1399,7 +1359,8 @@ async def confirm_individual_reading(callback: types.CallbackQuery, state: FSMCo
     cost = get_individual_reading_cost(db)
     user = get_or_create_user(db, callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
 
-    if user.balance < cost:
+    admin = is_admin(callback.from_user.id)
+    if not admin and user.balance < cost:
         await callback.message.edit_text(
             f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> <b>Недостаточно средств.</b>\n"
             f"Стоимость расклада: <b>{cost:.0f} руб.</b>\n"
@@ -1411,15 +1372,15 @@ async def confirm_individual_reading(callback: types.CallbackQuery, state: FSMCo
         db.close()
         return
 
-    # Списываем деньги сразу при нажатии кнопки
-    user.balance -= cost
-    transaction = Transaction(
-        user_id=user.id,
-        amount=-cost,
-        type='reading',
-        description=f'Индивидуальный расклад ({cost:.0f} руб.)'
-    )
-    db.add(transaction)
+    if not admin:
+        user.balance -= cost
+        transaction = Transaction(
+            user_id=user.id,
+            amount=-cost,
+            type='reading',
+            description=f'Индивидуальный расклад ({cost:.0f} руб.)'
+        )
+        db.add(transaction)
 
     reading = Reading(
         user_id=user.id,
@@ -1567,16 +1528,16 @@ async def confirm_palm_reading(callback: types.CallbackQuery, state: FSMContext)
     cost = get_palm_reading_cost(db)
     user = get_or_create_user(db, callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
     
-    if user.balance < cost:
+    if not is_admin(callback.from_user.id) and user.balance < cost:
         await callback.message.edit_text(
             f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Недостаточно средств для расклада.\n"
             f"Стоимость расклада: {cost:.2f} руб.\n"
             f"Пополните баланс, используя кнопку '💰 Баланс'.",
-            reply_markup=back_to_menu_keyboard()
-        , parse_mode="HTML")
+            reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
+        )
         db.close()
         return
-    
+
     await state.set_state(States.PALM_PHOTO)
     db.close()
     await callback.message.edit_text("Пожалуйста, отправьте фото вашей ладони:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
@@ -1587,71 +1548,63 @@ async def handle_palm_photo(message: types.Message, state: FSMContext):
     cost = get_palm_reading_cost(db)
     user = get_or_create_user(db, message.from_user.id, message.from_user.username, message.from_user.first_name)
     
-    if user.balance < cost:
+    admin = is_admin(message.from_user.id)
+    if not admin and user.balance < cost:
         await message.answer(
             f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Недостаточно средств для расклада.\n"
             f"Стоимость расклада: {cost:.2f} руб.\n"
             f"Пополните баланс, используя кнопку '💰 Баланс'.",
-            reply_markup=back_to_menu_keyboard()
-        , parse_mode="HTML")
+            reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
+        )
         await state.clear()
         db.close()
         return
-    
-    user.balance -= cost
-    transaction = Transaction(
-        user_id=user.id,
-        amount=-cost,
-        type='reading',
-        description=f'Расклад по ладони ({cost} руб.)'
-    )
-    db.add(transaction)
-    
+
+    if not admin:
+        user.balance -= cost
+        db.add(Transaction(
+            user_id=user.id,
+            amount=-cost,
+            type='reading',
+            description=f'Расклад по ладони ({cost} руб.)'
+        ))
+
     reading = Reading(
         user_id=user.id,
-        question1="",
-        question2="",
-        question3="",
-        question4="",
-        question5="",
-        cost=cost,
+        question1="", question2="", question3="", question4="", question5="",
+        cost=0 if admin else cost,
         reading_type='palm'
     )
     db.add(reading)
     db.commit()
     db.refresh(reading)
+    reading_id = reading.id
     db.close()
-    
+
     await state.clear()
-    progress_msg = await message.answer("✋ Рассматриваем линию жизни...")
-    
+    progress_msg = await message.answer("✋ Анализируем ладонь...")
+
     try:
         photo = message.photo[-1]
         file_info = await bot.get_file(photo.file_id)
         file_bytes = await bot.download_file(file_info.file_path)
         photo_base64 = base64.b64encode(file_bytes.getvalue()).decode('utf-8')
-        
-        await asyncio.sleep(60)
-        await progress_msg.edit_text("❤️ Исследуем линию сердца...")
-        await asyncio.sleep(60)
-        await progress_msg.edit_text("🧠 Анализируем линию головы...")
-        await asyncio.sleep(60)
-        await progress_msg.edit_text("🔮 Открываем судьбу по линиям...")
-        
+
         response = await generate_palm_reading(photo_base64)
-        
+
         db = SessionLocal()
-        reading = db.query(Reading).filter(Reading.id == reading.id).first()
-        reading.response = response
+        r = db.query(Reading).filter(Reading.id == reading_id).first()
+        r.response = response
         db.commit()
         db.close()
-        
+
         await progress_msg.edit_text(f"✨ Ваш расклад по ладони готов!\n\n{response}", reply_markup=back_to_menu_keyboard())
     except Exception as e:
+        logger.error(f"Palm reading error: {e}")
         await progress_msg.edit_text(
             "<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Произошла ошибка при генерации расклада. Попробуйте позже.",
-            reply_markup=back_to_menu_keyboard()
-        , parse_mode="HTML")
+            reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
+        )
 
 @dp.callback_query(F.data == "admin_menu")
 async def show_admin_menu(callback: types.CallbackQuery):
