@@ -2118,7 +2118,7 @@ async def main():
     migrate_database()
 
     logger.info(f"Loaded ADMIN_USER_IDS: {ADMIN_USER_IDS}")
-    scheduler.add_job(send_daily_card, 'cron', hour=12, minute=0, timezone=pytz.timezone('Europe/Moscow'))
+    scheduler.add_job(send_daily_card, 'cron', hour=12, minute=0, timezone=pytz.timezone('Europe/Moscow'), misfire_grace_time=3600)
     scheduler.start()
 
     logger.info("Bot started successfully!")
