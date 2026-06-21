@@ -349,18 +349,16 @@ async def generate_daily_card_description(card_name: str) -> str:
 
 async def generate_tarot_reading(question):
     selected_cards = random.sample(ALL_CARDS, 3)
-    past_card = selected_cards[0]['name']
-    present_card = selected_cards[1]['name']
-    future_card = selected_cards[2]['name']
+    cards_str = ' · '.join(c['name'] for c in selected_cards)
 
     prompt = f"""Ты профессиональный таролог.
 
 Вопрос: {question}
-Карты (прошлое → настоящее → будущее): {past_card} · {present_card} · {future_card}
+Карты расклада: {cards_str}
 
-Напиши текст из 3-4 абзацев (200-250 слов) о том, что эта тройка карт означает ВМЕСТЕ для данной ситуации.
+Напиши текст из 3-4 абзацев (200-250 слов) о том, что этот набор карт говорит об этой ситуации.
 Каждый абзац начинай с подходящего по смыслу эмодзи (разные для каждого абзаца).
-Не разбирай карты по отдельности — раскрой смысл их сочетания как единой картины.
+Раскрой общий смысл набора карт как единой картины — не разбирай каждую карту отдельно и не привязывай их к позициям.
 Будь честным: если карты указывают на трудности или неблагоприятный исход — говори прямо, без смягчений.
 Последний абзац — конкретный совет что делать.
 На русском, обращайся напрямую (ты/тебе), тон глубокий и честный.
@@ -432,9 +430,7 @@ async def generate_palm_reading(photo_base64_data):
 
 async def generate_compatibility_reading(name1: str, dob1: str, name2: str, dob2: str):
     selected_cards = random.sample(ALL_CARDS, 3)
-    card_union = selected_cards[0]['name']
-    card_challenges = selected_cards[1]['name']
-    card_future = selected_cards[2]['name']
+    cards_str = ' · '.join(c['name'] for c in selected_cards)
 
     dob_info = f" ({dob1})" if dob1 else ""
     dob_info2 = f" ({dob2})" if dob2 else ""
@@ -443,12 +439,12 @@ async def generate_compatibility_reading(name1: str, dob1: str, name2: str, dob2
     prompt = f"""Ты профессиональный таролог по отношениям.
 
 Пара: {name1}{dob_info} и {name2}{dob_info2}
-Карты: {card_union} · {card_challenges} · {card_future}
+Карты расклада: {cards_str}
 {dob_hint}
 
-Напиши текст из 3-4 абзацев (200-250 слов) о том, что эта тройка карт говорит об этих отношениях ВМЕСТЕ.
+Напиши текст из 3-4 абзацев (200-250 слов) о том, что этот набор карт говорит об этих отношениях.
 Каждый абзац начинай с подходящего по смыслу эмодзи (разные для каждого абзаца).
-Не разбирай карты по отдельности — раскрой смысл их сочетания как единой картины пары.
+Раскрой общий смысл набора карт как единой картины — не разбирай каждую карту отдельно и не привязывай их к позициям.
 Будь честным: если карты показывают напряжение, несовместимость или риски — говори прямо, без смягчений.
 Обращайся к паре по именам. Последний абзац — конкретные советы.
 На русском, тон честный.
