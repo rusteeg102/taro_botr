@@ -386,21 +386,18 @@ async def generate_tarot_reading(question):
     present_card = selected_cards[1]['name']
     future_card = selected_cards[2]['name']
 
-    prompt = f"""Ты профессиональный таролог. Отвечай строго в JSON без markdown-блоков.
+    prompt = f"""Ты профессиональный таролог.
 
-Вопрос пользователя: {question}
-Карты: Прошлое — {past_card}, Настоящее — {present_card}, Будущее — {future_card}
+Вопрос: {question}
+Карты (прошлое → настоящее → будущее): {past_card} · {present_card} · {future_card}
 
-Верни ровно такой JSON (не более 130 слов в каждом поле):
-{{
-  "intro": "✨ Общая ситуация\\n<3-4 предложения о ситуации: что происходит, какие энергии вокруг этой темы, почему это важно сейчас>",
-  "past": "🔮 Прошлое — {past_card}\\n<как прошлое сформировало текущую ситуацию, что стоит осознать или отпустить>",
-  "present": "🔮 Настоящее — {present_card}\\n<что происходит прямо сейчас, какие скрытые факторы влияют, конкретные шаги>",
-  "future": "🔮 Будущее — {future_card}\\n<что ждёт впереди, при каких условиях ситуация разрешится лучше всего>",
-  "advice": "💡 Что делать дальше\\n<4-5 конкретных советов с объяснением каждого>\\n\\n🌟 Итог\\n<2-3 предложения поддержки и напутствия>"
-}}
+Напиши один связный текст (400-500 слов) о том, что эта тройка карт означает ВМЕСТЕ для данной ситуации.
+Не разбирай карты по отдельности — раскрой смысл их сочетания как единой картины.
+Будь честным: если карты указывают на трудности, предупреждение или неблагоприятный исход — говори об этом прямо, без смягчений.
+Заверши конкретными рекомендациями что делать.
+На русском, обращайся напрямую (ты/тебе), тон глубокий и честный.
 
-На русском, без общих фраз, обращайся к ситуации лично, атмосфера таинственная и глубокая."""
+Верни только JSON: {{"full": "<текст расклада>"}}"""
 
     response = await asyncio.to_thread(
         openai_client.chat.completions.create,
@@ -471,23 +468,23 @@ async def generate_compatibility_reading(name1: str, dob1: str, name2: str, dob2
     card_challenges = selected_cards[1]['name']
     card_future = selected_cards[2]['name']
 
-    prompt = f"""Ты таролог. Отвечай строго в JSON без markdown-блоков.
+    dob_info = f" ({dob1})" if dob1 else ""
+    dob_info2 = f" ({dob2})" if dob2 else ""
+    dob_hint = "Учитывай даты рождения в анализе совместимости." if dob1 and dob2 else ""
 
-Пара: {name1} (дата рождения: {dob1}) и {name2} (дата рождения: {dob2})
-Карты: Союз — {card_union}, Испытания — {card_challenges}, Будущее — {card_future}
+    prompt = f"""Ты профессиональный таролог по отношениям.
 
-Учитывай даты рождения: нумерологию жизненного пути, астрологические особенности, совместимость характеров.
+Пара: {name1}{dob_info} и {name2}{dob_info2}
+Карты: {card_union} · {card_challenges} · {card_future}
+{dob_hint}
 
-Верни ровно такой JSON (не более 130 слов в каждом поле):
-{{
-  "intro": "💑 Энергия пары {name1} и {name2}\\n<3-4 предложения: какая общая энергетика у этого союза с учётом дат рождения, что притягивает этих двоих друг к другу>",
-  "union": "🃏 Союз — {card_union}\\n<что объединяет {name1} и {name2}, их сильные стороны как пары, что они дают друг другу>",
-  "challenges": "🃏 Испытания — {card_challenges}\\n<конкретные трудности и противоречия, о чём важно поговорить, что мешает гармонии>",
-  "future": "🃏 Будущее — {card_future}\\n<куда движутся отношения, при каких условиях они расцветут, чего стоит избегать>",
-  "advice": "💡 Советы для {name1} и {name2}\\n<4-5 конкретных советов с объяснением>\\n\\n🌟 Итог\\n<тёплое и честное заключение об этом союзе>"
-}}
+Напиши один связный текст (400-500 слов) о том, что эта тройка карт говорит об этих отношениях ВМЕСТЕ.
+Не разбирай карты по отдельности — раскрой смысл их сочетания как единой картины пары.
+Будь честным: если карты показывают напряжение, несовместимость или серьёзные риски — говори об этом прямо, без смягчений.
+Обращайся к паре по именам. Заверши конкретными советами.
+На русском, тон честный.
 
-Обращайся по именам {name1} и {name2}. На русском. Атмосфера тёплая, но честная, без лишних прикрас."""
+Верни только JSON: {{"full": "<текст расклада>"}}"""
 
     response = await asyncio.to_thread(
         openai_client.chat.completions.create,
@@ -552,7 +549,7 @@ async def confirm_compatibility(callback: types.CallbackQuery, state: FSMContext
     db.close()
     await state.set_state(States.COMPAT_NAME1)
     await callback.message.edit_text(
-        "✍️ Введите имя и дату рождения <b>первого</b> партнёра:\n\n<i>Пример: Иван 01.01.1990</i>",
+        "✍️ Введите имя и дату рождения <b>первого</b> партнёра:",
         parse_mode="HTML",
         reply_markup=back_to_menu_keyboard()
     )
@@ -575,7 +572,7 @@ async def compat_name1(message: types.Message, state: FSMContext):
     await state.update_data(compat_name1=name1, compat_dob1=dob1)
     await state.set_state(States.COMPAT_NAME2)
     await message.answer(
-        "✍️ Введите имя и дату рождения <b>второго</b> партнёра:\n\n<i>Пример: Мария 15.05.1995</i>",
+        "✍️ Введите имя и дату рождения <b>второго</b> партнёра:",
         parse_mode="HTML"
     )
 
@@ -647,12 +644,7 @@ async def compat_name2(message: types.Message, state: FSMContext):
 
         await progress_msg.delete()
         await send_cards_album(message.chat.id, selected_cards)
-        combined = '\n\n'.join(filter(None, [
-            sections.get('intro'), sections.get('union'),
-            sections.get('challenges'), sections.get('future'), sections.get('advice'),
-            sections.get('full')
-        ]))
-        await message.answer(combined, reply_markup=back_to_menu_keyboard())
+        await message.answer(sections.get('full', ''), reply_markup=back_to_menu_keyboard())
     except Exception as e:
         logger.error(f"Compatibility reading error: {e}")
         await progress_msg.edit_text(
@@ -1177,12 +1169,7 @@ async def question1(message: types.Message, state: FSMContext):
 
         await progress_msg.delete()
         await send_cards_album(message.chat.id, selected_cards)
-        combined = '\n\n'.join(filter(None, [
-            sections.get('intro'), sections.get('past'),
-            sections.get('present'), sections.get('future'), sections.get('advice'),
-            sections.get('full')
-        ]))
-        await message.answer(combined, reply_markup=back_to_menu_keyboard())
+        await message.answer(sections.get('full', ''), reply_markup=back_to_menu_keyboard())
     except Exception as e:
         logger.error(f"Standard reading error: {e}")
         await progress_msg.edit_text(
