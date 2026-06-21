@@ -341,27 +341,46 @@ async def send_card_photo_safe(chat_id: int, card: dict, caption: str, reply_mar
     # Fallback: text only
     await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
 
+async def _download_card_bytes(url: str) -> bytes | None:
+    """Download card image bytes with browser User-Agent."""
+    try:
+        import aiohttp as _aiohttp
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; TarotBot/1.0)"}
+        async with _aiohttp.ClientSession(headers=headers) as sess:
+            async with sess.get(url, timeout=_aiohttp.ClientTimeout(total=20), allow_redirects=True) as r:
+                if r.status == 200:
+                    return await r.read()
+    except Exception:
+        pass
+    return None
+
 async def send_cards_album(chat_id: int, cards: list):
-    """Send tarot cards as one media group (album). Falls back to individual if needed."""
+    """Send tarot cards as one media group (album). Downloads bytes to avoid IMAGE_PROCESS_FAILED."""
     media = []
-    for card in cards:
+    for i, card in enumerate(cards):
         url = card.get('image_url', '').strip().replace('`', '')
-        if url and url.startswith('https://'):
-            media.append(InputMediaPhoto(media=url))
+        if not url or not url.startswith('https://'):
+            continue
+        img_bytes = await _download_card_bytes(url)
+        if img_bytes:
+            media.append(InputMediaPhoto(media=BufferedInputFile(img_bytes, f"card_{i}.jpg")))
+
     if len(media) >= 2:
         try:
             await bot.send_media_group(chat_id=chat_id, media=media)
             return
         except Exception as e:
             logger.error(f"send_media_group failed: {e}")
-    # Fallback: individual photos without caption
-    for card in cards:
-        try:
-            url = card.get('image_url', '').strip().replace('`', '')
-            if url and url.startswith('https://'):
-                await bot.send_photo(chat_id=chat_id, photo=url)
-        except Exception:
-            pass
+    # Fallback: send what we could download individually
+    for i, card in enumerate(cards):
+        url = card.get('image_url', '').strip().replace('`', '')
+        if url and url.startswith('https://'):
+            img_bytes = await _download_card_bytes(url)
+            if img_bytes:
+                try:
+                    await bot.send_photo(chat_id=chat_id, photo=BufferedInputFile(img_bytes, f"card_{i}.jpg"))
+                except Exception:
+                    pass
 
 async def generate_tarot_reading(question):
     selected_cards = random.sample(TAROT_CARDS, 3)
