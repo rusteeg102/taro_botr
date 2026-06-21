@@ -24,7 +24,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    BufferedInputFile
+    BufferedInputFile,
+    InputMediaPhoto
 )
 
 from models import (
@@ -93,7 +94,9 @@ class States(StatesGroup):
     RESET_USER = State()
     PALM_PHOTO = State()
     COMPAT_NAME1 = State()
+    COMPAT_DOB1 = State()
     COMPAT_NAME2 = State()
+    COMPAT_DOB2 = State()
     BALANCE_USER = State()
     BALANCE_AMOUNT = State()
 
@@ -338,6 +341,28 @@ async def send_card_photo_safe(chat_id: int, card: dict, caption: str, reply_mar
     # Fallback: text only
     await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
 
+async def send_cards_album(chat_id: int, cards: list):
+    """Send tarot cards as one media group (album). Falls back to individual if needed."""
+    media = []
+    for card in cards:
+        url = card.get('image_url', '').strip().replace('`', '')
+        if url and url.startswith('https://'):
+            media.append(InputMediaPhoto(media=url))
+    if len(media) >= 2:
+        try:
+            await bot.send_media_group(chat_id=chat_id, media=media)
+            return
+        except Exception as e:
+            logger.error(f"send_media_group failed: {e}")
+    # Fallback: individual photos without caption
+    for card in cards:
+        try:
+            url = card.get('image_url', '').strip().replace('`', '')
+            if url and url.startswith('https://'):
+                await bot.send_photo(chat_id=chat_id, photo=url)
+        except Exception:
+            pass
+
 async def generate_tarot_reading(question):
     selected_cards = random.sample(TAROT_CARDS, 3)
     past_card = selected_cards[0]['name']
@@ -423,7 +448,7 @@ async def generate_palm_reading(photo_base64_data):
 
 
 
-async def generate_compatibility_reading(name1: str, name2: str):
+async def generate_compatibility_reading(name1: str, dob1: str, name2: str, dob2: str):
     selected_cards = random.sample(TAROT_CARDS, 3)
     card_union = selected_cards[0]['name']
     card_challenges = selected_cards[1]['name']
@@ -431,12 +456,14 @@ async def generate_compatibility_reading(name1: str, name2: str):
 
     prompt = f"""Ты таролог. Отвечай строго в JSON без markdown-блоков.
 
-Пара: {name1} и {name2}
+Пара: {name1} (дата рождения: {dob1}) и {name2} (дата рождения: {dob2})
 Карты: Союз — {card_union}, Испытания — {card_challenges}, Будущее — {card_future}
+
+Учитывай даты рождения: нумерологию жизненного пути, астрологические особенности, совместимость характеров.
 
 Верни ровно такой JSON (не более 130 слов в каждом поле):
 {{
-  "intro": "💑 Энергия пары {name1} и {name2}\\n<3-4 предложения: какая общая энергетика у этого союза, что притягивает этих двоих друг к другу, какое взаимодействие между ними>",
+  "intro": "💑 Энергия пары {name1} и {name2}\\n<3-4 предложения: какая общая энергетика у этого союза с учётом дат рождения, что притягивает этих двоих друг к другу>",
   "union": "🃏 Союз — {card_union}\\n<что объединяет {name1} и {name2}, их сильные стороны как пары, что они дают друг другу>",
   "challenges": "🃏 Испытания — {card_challenges}\\n<конкретные трудности и противоречия, о чём важно поговорить, что мешает гармонии>",
   "future": "🃏 Будущее — {card_future}\\n<куда движутся отношения, при каких условиях они расцветут, чего стоит избегать>",
@@ -517,15 +544,31 @@ async def confirm_compatibility(callback: types.CallbackQuery, state: FSMContext
 @dp.message(States.COMPAT_NAME1)
 async def compat_name1(message: types.Message, state: FSMContext):
     await state.update_data(compat_name1=message.text.strip())
+    await state.set_state(States.COMPAT_DOB1)
+    await message.answer("📅 Введите дату рождения <b>первого</b> партнёра (ДД.ММ.ГГГГ):", parse_mode="HTML")
+
+
+@dp.message(States.COMPAT_DOB1)
+async def compat_dob1(message: types.Message, state: FSMContext):
+    await state.update_data(compat_dob1=message.text.strip())
     await state.set_state(States.COMPAT_NAME2)
     await message.answer("✍️ Теперь введите имя <b>второго</b> партнёра:", parse_mode="HTML")
 
 
 @dp.message(States.COMPAT_NAME2)
 async def compat_name2(message: types.Message, state: FSMContext):
+    await state.update_data(compat_name2=message.text.strip())
+    await state.set_state(States.COMPAT_DOB2)
+    await message.answer("📅 Введите дату рождения <b>второго</b> партнёра (ДД.ММ.ГГГГ):", parse_mode="HTML")
+
+
+@dp.message(States.COMPAT_DOB2)
+async def compat_dob2(message: types.Message, state: FSMContext):
     data = await state.get_data()
     name1 = data.get("compat_name1", "")
-    name2 = message.text.strip()
+    dob1 = data.get("compat_dob1", "")
+    name2 = data.get("compat_name2", "")
+    dob2 = message.text.strip()
 
     db = SessionLocal()
     cost = get_compatibility_reading_cost(db)
@@ -552,11 +595,11 @@ async def compat_name2(message: types.Message, state: FSMContext):
 
     reading = Reading(
         user_id=user.id,
-        question1=f"Совместимость: {name1} и {name2}",
+        question1=f"Совместимость: {name1} ({dob1}) и {name2} ({dob2})",
         question2=name1,
         question3=name2,
-        question4="",
-        question5="",
+        question4=dob1,
+        question5=dob2,
         cost=0 if admin else cost,
         reading_type='compatibility'
     )
@@ -567,7 +610,7 @@ async def compat_name2(message: types.Message, state: FSMContext):
     await send_log(
         f"💑 <b>Совместимость пары</b>\n"
         f"👤 {fmt_user(user.first_name, user.username, user.telegram_id)}\n"
-        f"👫 Пара: <b>{name1}</b> и <b>{name2}</b>\n"
+        f"👫 Пара: <b>{name1}</b> ({dob1}) и <b>{name2}</b> ({dob2})\n"
         f"💰 Стоимость: <b>{'бесплатно (демо-режим)' if admin else f'{cost:.0f} руб.'}</b>\n"
         f"🆔 Расклад №{reading_id}\n"
         f"⏰ {fmt_time()}"
@@ -577,7 +620,7 @@ async def compat_name2(message: types.Message, state: FSMContext):
 
     progress_msg = await message.answer("❤️ Раскладываем карты для вашей пары...")
     try:
-        sections, selected_cards = await generate_compatibility_reading(name1, name2)
+        sections, selected_cards = await generate_compatibility_reading(name1, dob1, name2, dob2)
 
         db = SessionLocal()
         r = db.query(Reading).filter(Reading.id == reading_id).first()
@@ -585,16 +628,14 @@ async def compat_name2(message: types.Message, state: FSMContext):
         db.commit()
         db.close()
 
-        if "full" in sections:
-            for card in selected_cards:
-                await send_card_photo_safe(message.chat.id, card, f"🃏 {card['name']}")
-            await progress_msg.edit_text(f"✨ Расклад готов!\n\n{sections['full']}", reply_markup=back_to_menu_keyboard())
-        else:
-            await progress_msg.edit_text(sections.get("intro", "❤️ Расклад..."))
-            for i, key in enumerate(["union", "challenges", "future"]):
-                section_text = sections.get(key, "")
-                await send_card_photo_safe(message.chat.id, selected_cards[i], section_text)
-            await message.answer(sections.get("advice", ""), reply_markup=back_to_menu_keyboard())
+        await progress_msg.delete()
+        await send_cards_album(message.chat.id, selected_cards)
+        combined = '\n\n'.join(filter(None, [
+            sections.get('intro'), sections.get('union'),
+            sections.get('challenges'), sections.get('future'), sections.get('advice'),
+            sections.get('full')
+        ]))
+        await message.answer(combined, reply_markup=back_to_menu_keyboard())
     except Exception as e:
         logger.error(f"Compatibility reading error: {e}")
         await progress_msg.edit_text(
@@ -1009,7 +1050,8 @@ async def confirm_standard_reading(callback: types.CallbackQuery, state: FSMCont
         await callback.message.edit_text(QUESTION, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
         return
 
-    if not is_admin(callback.from_user.id) and user.balance < cost:
+    admin_demo = is_admin(callback.from_user.id) and get_demo_balance(db)
+    if not admin_demo and user.balance < cost:
         await callback.message.edit_text(
             f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Недостаточно средств для расклада.\n"
             f"Стоимость расклада: {cost:.2f} руб.\n"
@@ -1116,16 +1158,14 @@ async def question1(message: types.Message, state: FSMContext):
         db.commit()
         db.close()
 
-        if "full" in sections:
-            for card in selected_cards:
-                await send_card_photo_safe(message.chat.id, card, f"🃏 {card['name']}")
-            await progress_msg.edit_text(f"✨ Ваш расклад готов!\n\n{sections['full']}", reply_markup=back_to_menu_keyboard())
-        else:
-            await progress_msg.edit_text(sections.get("intro", "🔮 Расклад..."))
-            for i, key in enumerate(["past", "present", "future"]):
-                section_text = sections.get(key, "")
-                await send_card_photo_safe(message.chat.id, selected_cards[i], section_text)
-            await message.answer(sections.get("advice", ""), reply_markup=back_to_menu_keyboard())
+        await progress_msg.delete()
+        await send_cards_album(message.chat.id, selected_cards)
+        combined = '\n\n'.join(filter(None, [
+            sections.get('intro'), sections.get('past'),
+            sections.get('present'), sections.get('future'), sections.get('advice'),
+            sections.get('full')
+        ]))
+        await message.answer(combined, reply_markup=back_to_menu_keyboard())
     except Exception as e:
         logger.error(f"Standard reading error: {e}")
         await progress_msg.edit_text(
@@ -1339,8 +1379,8 @@ async def confirm_palm_reading(callback: types.CallbackQuery, state: FSMContext)
     db = SessionLocal()
     cost = get_palm_reading_cost(db)
     user = get_or_create_user(db, callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
-    
-    if not is_admin(callback.from_user.id) and user.balance < cost:
+    admin_demo = is_admin(callback.from_user.id) and get_demo_balance(db)
+    if not admin_demo and user.balance < cost:
         await callback.message.edit_text(
             f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Недостаточно средств для расклада.\n"
             f"Стоимость расклада: {cost:.2f} руб.\n"
