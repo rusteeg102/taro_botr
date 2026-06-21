@@ -25,6 +25,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     BufferedInputFile,
+    FSInputFile,
     InputMediaPhoto
 )
 
@@ -108,60 +109,36 @@ def get_card_of_the_day(db):
     card_setting = db.query(Setting).filter(Setting.key == 'card_of_the_day').first()
     date_setting = db.query(Setting).filter(Setting.key == 'card_of_the_day_date').first()
     
-    need_new_card = False
-    if not card_setting or not date_setting or date_setting.value != str(today):
-        need_new_card = True
-    else:
-        try:
-            test_card = json.loads(card_setting.value)
-            image_url = test_card.get('image_url', '')
-            if '`' in image_url or not image_url.startswith('https://'):
-                need_new_card = True
-        except Exception:
-            need_new_card = True
-    
+    need_new_card = not card_setting or not date_setting or date_setting.value != str(today)
+
     if need_new_card:
         selected_card = random.choice(TAROT_CARDS)
-        selected_card_copy = selected_card.copy()
-        selected_card_copy['image_url'] = selected_card_copy['image_url'].strip()
-        selected_card_copy['image_url'] = selected_card_copy['image_url'].replace('`', '')
-        card_json = json.dumps(selected_card_copy, ensure_ascii=False)
-        
+        card_json = json.dumps({"name": selected_card["name"]}, ensure_ascii=False)
+
         if not card_setting:
             card_setting = Setting(key='card_of_the_day', value=card_json)
         else:
             card_setting.value = card_json
-            
+
         if not date_setting:
             date_setting = Setting(key='card_of_the_day_date', value=str(today))
         else:
             date_setting.value = str(today)
-            
+
         db.add(card_setting)
         db.add(date_setting)
         db.commit()
-        return selected_card_copy
+        return selected_card
     else:
         try:
-            selected_card = json.loads(card_setting.value)
-            if 'image_url' in selected_card:
-                selected_card['image_url'] = selected_card['image_url'].strip().strip('`').replace('`', '').strip()
-            if 'image_path' not in selected_card:
-                for card in TAROT_CARDS:
-                    if card['name'] == selected_card['name']:
-                        selected_card['image_path'] = card.get('image_path')
-                        break
+            saved = json.loads(card_setting.value)
+            card_name = saved.get("name", "")
+            for card in TAROT_CARDS:
+                if card["name"] == card_name:
+                    return card
         except Exception:
-            selected_card = random.choice(TAROT_CARDS)
-            selected_card_copy = selected_card.copy()
-            selected_card_copy['image_url'] = selected_card_copy['image_url'].strip().replace('`', '')
-            card_json = json.dumps(selected_card_copy, ensure_ascii=False)
-            card_setting.value = card_json
-            date_setting.value = str(today)
-            db.commit()
-            return selected_card_copy
-        
-        return selected_card
+            pass
+        return random.choice(TAROT_CARDS)
 
 def get_or_create_user(db, telegram_id, username, first_name):
     user = db.query(User).filter(User.telegram_id == telegram_id).first()
@@ -310,58 +287,28 @@ async def transcribe_voice(audio_bytes: bytes) -> str:
     return await asyncio.to_thread(_transcribe)
 
 async def send_card_photo_safe(chat_id: int, card: dict, caption: str, reply_markup=None):
-    """Send a tarot card photo. Try URL → download with headers → text fallback."""
-    url = card.get("image_url", "").strip()
+    """Send a tarot card photo from local file, fallback to text."""
+    local_path = card.get("image_path", "")
     kwargs = {"chat_id": chat_id, "caption": caption[:1024]}
     if reply_markup:
         kwargs["reply_markup"] = reply_markup
 
-    if url:
-        # Try 1: let Telegram download from URL directly
+    if local_path and os.path.isfile(local_path):
         try:
-            await bot.send_photo(photo=url, **kwargs)
-            return
-        except Exception:
-            pass
-
-        # Try 2: download ourselves with browser User-Agent, then send bytes
-        try:
-            import aiohttp as _aiohttp
-            headers = {"User-Agent": "Mozilla/5.0 (compatible; TarotBot/1.0)"}
-            async with _aiohttp.ClientSession(headers=headers) as sess:
-                async with sess.get(url, timeout=_aiohttp.ClientTimeout(total=20), allow_redirects=True) as r:
-                    img_bytes = await r.read()
-            await bot.send_photo(photo=BufferedInputFile(img_bytes, "card.jpg"), **kwargs)
+            await bot.send_photo(photo=FSInputFile(local_path), **kwargs)
             return
         except Exception as e:
             logger.error(f"Card photo send failed ({card.get('name')}): {e}")
 
-    # Fallback: text only
     await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
 
-async def _download_card_bytes(url: str) -> bytes | None:
-    """Download card image bytes with browser User-Agent."""
-    try:
-        import aiohttp as _aiohttp
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; TarotBot/1.0)"}
-        async with _aiohttp.ClientSession(headers=headers) as sess:
-            async with sess.get(url, timeout=_aiohttp.ClientTimeout(total=20), allow_redirects=True) as r:
-                if r.status == 200:
-                    return await r.read()
-    except Exception:
-        pass
-    return None
-
 async def send_cards_album(chat_id: int, cards: list):
-    """Send tarot cards as one media group (album). Downloads bytes to avoid IMAGE_PROCESS_FAILED."""
+    """Send tarot cards as one media group (album) from local files."""
     media = []
     for i, card in enumerate(cards):
-        url = card.get('image_url', '').strip().replace('`', '')
-        if not url or not url.startswith('https://'):
-            continue
-        img_bytes = await _download_card_bytes(url)
-        if img_bytes:
-            media.append(InputMediaPhoto(media=BufferedInputFile(img_bytes, f"card_{i}.jpg")))
+        local_path = card.get('image_path', '')
+        if local_path and os.path.isfile(local_path):
+            media.append(InputMediaPhoto(media=FSInputFile(local_path)))
 
     if len(media) >= 2:
         try:
@@ -369,16 +316,14 @@ async def send_cards_album(chat_id: int, cards: list):
             return
         except Exception as e:
             logger.error(f"send_media_group failed: {e}")
-    # Fallback: send what we could download individually
-    for i, card in enumerate(cards):
-        url = card.get('image_url', '').strip().replace('`', '')
-        if url and url.startswith('https://'):
-            img_bytes = await _download_card_bytes(url)
-            if img_bytes:
-                try:
-                    await bot.send_photo(chat_id=chat_id, photo=BufferedInputFile(img_bytes, f"card_{i}.jpg"))
-                except Exception:
-                    pass
+    # Fallback: send individually
+    for card in cards:
+        local_path = card.get('image_path', '')
+        if local_path and os.path.isfile(local_path):
+            try:
+                await bot.send_photo(chat_id=chat_id, photo=FSInputFile(local_path))
+            except Exception:
+                pass
 
 async def generate_tarot_reading(question):
     selected_cards = random.sample(TAROT_CARDS, 3)
@@ -754,33 +699,26 @@ async def daily_card(callback: types.CallbackQuery):
     await callback.answer()
     db = SessionLocal()
     card = get_card_of_the_day(db)
-    
-    photo_url = card.get('image_url')
+
     text = (f"🌙 Карта дня: {card['name']}\n\n"
             f"{card['description']}\n\n"
             f"{card['meaning']}")
-    
-    keyboard = [
-        [main_menu_button()]
-    ]
-    
-    if photo_url:
-        card_obj = {"image_url": photo_url, "name": card.get("name", "")}
-        sent = False
-        try:
-            await send_card_photo_safe(
-                callback.from_user.id, card_obj, text[:1024],
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-            )
-            sent = True
-            await callback.message.delete()
-        except Exception:
-            pass
-        if not sent:
-            await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
-    else:
+
+    keyboard = [[main_menu_button()]]
+
+    sent = False
+    try:
+        await send_card_photo_safe(
+            callback.from_user.id, card, text[:1024],
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
+        )
+        sent = True
+        await callback.message.delete()
+    except Exception:
+        pass
+    if not sent:
         await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
-    
+
     db.close()
 
 @dp.callback_query(F.data == "help")
@@ -2131,27 +2069,23 @@ async def send_daily_card():
     try:
         card = get_card_of_the_day(db)
         users = db.query(User).all()
-        
+        local_path = card.get('image_path', '')
+
         for user in users:
             try:
-                photo_url = card.get('image_url')
-                
                 text = (f"🌞 Карта дня: {card['name']}\n\n"
                         f"{card['description']}\n\n"
                         f"{card['meaning']}")
-                
-                if photo_url:
+
+                if local_path and os.path.isfile(local_path):
                     await bot.send_photo(
                         chat_id=user.telegram_id,
-                        photo=photo_url,
-                        caption=text
+                        photo=FSInputFile(local_path),
+                        caption=text[:1024]
                     )
                 else:
-                    await bot.send_message(
-                        chat_id=user.telegram_id,
-                        text=text
-                    )
-            except Exception as e:
+                    await bot.send_message(chat_id=user.telegram_id, text=text)
+            except Exception:
                 pass
     finally:
         db.close()
