@@ -94,9 +94,7 @@ class States(StatesGroup):
     RESET_USER = State()
     PALM_PHOTO = State()
     COMPAT_NAME1 = State()
-    COMPAT_DOB1 = State()
     COMPAT_NAME2 = State()
-    COMPAT_DOB2 = State()
     BALANCE_USER = State()
     BALANCE_AMOUNT = State()
 
@@ -554,40 +552,40 @@ async def confirm_compatibility(callback: types.CallbackQuery, state: FSMContext
     db.close()
     await state.set_state(States.COMPAT_NAME1)
     await callback.message.edit_text(
-        "✍️ Введите имя <b>первого</b> партнёра:",
+        "✍️ Введите имя и дату рождения <b>первого</b> партнёра:\n\n<i>Пример: Иван 01.01.1990</i>",
         parse_mode="HTML",
         reply_markup=back_to_menu_keyboard()
     )
 
 
+def _parse_name_dob(text: str) -> tuple[str, str]:
+    """Split 'Иван 01.01.1990' into ('Иван', '01.01.1990'). Falls back to (text, '') if no date found."""
+    import re
+    m = re.search(r'(\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4})', text)
+    if m:
+        dob = m.group(1)
+        name = text[:m.start()].strip() or text[m.end():].strip()
+        return name, dob
+    return text.strip(), ''
+
+
 @dp.message(States.COMPAT_NAME1)
 async def compat_name1(message: types.Message, state: FSMContext):
-    await state.update_data(compat_name1=message.text.strip())
-    await state.set_state(States.COMPAT_DOB1)
-    await message.answer("📅 Введите дату рождения <b>первого</b> партнёра (ДД.ММ.ГГГГ):", parse_mode="HTML")
-
-
-@dp.message(States.COMPAT_DOB1)
-async def compat_dob1(message: types.Message, state: FSMContext):
-    await state.update_data(compat_dob1=message.text.strip())
+    name1, dob1 = _parse_name_dob(message.text.strip())
+    await state.update_data(compat_name1=name1, compat_dob1=dob1)
     await state.set_state(States.COMPAT_NAME2)
-    await message.answer("✍️ Теперь введите имя <b>второго</b> партнёра:", parse_mode="HTML")
+    await message.answer(
+        "✍️ Введите имя и дату рождения <b>второго</b> партнёра:\n\n<i>Пример: Мария 15.05.1995</i>",
+        parse_mode="HTML"
+    )
 
 
 @dp.message(States.COMPAT_NAME2)
 async def compat_name2(message: types.Message, state: FSMContext):
-    await state.update_data(compat_name2=message.text.strip())
-    await state.set_state(States.COMPAT_DOB2)
-    await message.answer("📅 Введите дату рождения <b>второго</b> партнёра (ДД.ММ.ГГГГ):", parse_mode="HTML")
-
-
-@dp.message(States.COMPAT_DOB2)
-async def compat_dob2(message: types.Message, state: FSMContext):
     data = await state.get_data()
     name1 = data.get("compat_name1", "")
     dob1 = data.get("compat_dob1", "")
-    name2 = data.get("compat_name2", "")
-    dob2 = message.text.strip()
+    name2, dob2 = _parse_name_dob(message.text.strip())
 
     db = SessionLocal()
     cost = get_compatibility_reading_cost(db)
