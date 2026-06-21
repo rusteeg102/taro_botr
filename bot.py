@@ -111,14 +111,14 @@ def build_cards_page_keyboard(cards: list, page: int) -> InlineKeyboardMarkup:
 
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"cpage_{page - 1}"))
+        nav.append(InlineKeyboardButton(text="«", callback_data=f"cpage_{page - 1}"))
     nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"cpage_{page + 1}"))
+        nav.append(InlineKeyboardButton(text="»", callback_data=f"cpage_{page + 1}"))
     if nav:
         keyboard.append(nav)
 
-    keyboard.append([InlineKeyboardButton(text="➕ Добавить карту", style="success", callback_data="cadd")])
+    keyboard.append([InlineKeyboardButton(text="Добавить карту", style="success", callback_data="cadd")])
     keyboard.append([InlineKeyboardButton(text="« Назад к админ-панели", style="primary", callback_data="admin_menu")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 from sqlalchemy import func
@@ -310,7 +310,7 @@ def admin_menu_keyboard():
         [InlineKeyboardButton(icon_custom_emoji_id="6043874504302661409", text="Выгрузка пользователей (Excel)", style="primary", callback_data="admin_export_users")],
         [InlineKeyboardButton(icon_custom_emoji_id="6039381989985882045", text="Рассылка пользователям", style="primary", callback_data="admin_broadcast")],
         [InlineKeyboardButton(icon_custom_emoji_id="5904462880941545555", text="Цены на расклады", style="primary", callback_data="admin_set_prices")],
-        [InlineKeyboardButton(text="🃏 Управление картами", style="primary", callback_data="admin_cards")],
+        [InlineKeyboardButton(icon_custom_emoji_id="6037373985400819577", text="Управление картами", style="primary", callback_data="admin_cards")],
         [InlineKeyboardButton(icon_custom_emoji_id="6032742198179532882", text="Сброс данных", style="primary", callback_data="admin_reset")],
         [InlineKeyboardButton(
             icon_custom_emoji_id="5920332557466997677",
@@ -2251,8 +2251,9 @@ async def card_add_start(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(States.ADMIN_ADD_CARD_PHOTO)
     await callback.message.edit_text(
-        "📸 Пришлите фото новой карты:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", style="danger", callback_data="admin_cards")]])
+        '<tg-emoji emoji-id="6030466823290360017">🖼</tg-emoji> Пришлите фото новой карты:',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", style="danger", callback_data="admin_cards")]]),
+        parse_mode="HTML"
     )
 
 @dp.message(States.ADMIN_ADD_CARD_PHOTO)
@@ -2267,8 +2268,9 @@ async def card_add_photo(message: types.Message, state: FSMContext):
     await state.update_data(new_card_file_id=file_id)
     await state.set_state(States.ADMIN_ADD_CARD_NAME)
     await message.answer(
-        "✏️ Теперь введите название карты:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", style="danger", callback_data="admin_cards")]])
+        '<tg-emoji emoji-id="6039614175917903752">✏️</tg-emoji> Введите название карты:',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", style="danger", callback_data="admin_cards")]]),
+        parse_mode="HTML"
     )
 
 @dp.message(States.ADMIN_ADD_CARD_NAME)
