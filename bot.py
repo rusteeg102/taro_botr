@@ -1220,7 +1220,7 @@ async def show_individual_reading(callback: types.CallbackQuery, state: FSMConte
     master = MASTER_USERNAME or "@master"
     master_link = f"https://t.me/{master.lstrip('@')}"
     keyboard = [
-        [InlineKeyboardButton(text='<tg-emoji emoji-id="6034831751308644168">💬</tg-emoji> Написать мастеру', url=master_link)],
+        [InlineKeyboardButton(icon_custom_emoji_id="6034831751308644168", text="Написать мастеру", url=master_link)],
         [main_menu_button()]
     ]
     await callback.message.edit_text(
