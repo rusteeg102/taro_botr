@@ -746,7 +746,7 @@ async def admin_command(message: types.Message):
         await message.answer("<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> У вас нет прав для доступа к админ-панели.", reply_markup=back_to_menu_keyboard(), parse_mode="HTML")
         return
     
-    await message.answer("🔐 Админ-панель:", reply_markup=admin_menu_keyboard())
+    await message.answer('<tg-emoji emoji-id="6037496202990194718">🔓</tg-emoji> Админ-панель:', reply_markup=admin_menu_keyboard(), parse_mode="HTML")
 
 @dp.callback_query(F.data == "menu")
 async def menu_callback(callback: types.CallbackQuery):
@@ -1506,7 +1506,7 @@ async def show_admin_menu(callback: types.CallbackQuery):
         return
 
     await callback.answer()
-    await callback.message.edit_text("🔐 Админ-панель:", reply_markup=admin_menu_keyboard())
+    await callback.message.edit_text('<tg-emoji emoji-id="6037496202990194718">🔓</tg-emoji> Админ-панель:', reply_markup=admin_menu_keyboard(), parse_mode="HTML")
 
 @dp.callback_query(F.data == "admin_toggle_demo")
 async def admin_toggle_demo_handler(callback: types.CallbackQuery):
@@ -1520,8 +1520,8 @@ async def admin_toggle_demo_handler(callback: types.CallbackQuery):
     db.close()
     new_state = "включён" if not current else "выключен"
     await callback.message.edit_text(
-        f"🔐 Админ-панель:\n\nДемо баланс {new_state}.",
-        reply_markup=admin_menu_keyboard()
+        f'<tg-emoji emoji-id="6037496202990194718">🔓</tg-emoji> Админ-панель:\n\nДемо баланс {new_state}.',
+        reply_markup=admin_menu_keyboard(), parse_mode="HTML"
     )
 
 @dp.callback_query(F.data == "admin_stats")
