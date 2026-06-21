@@ -2166,7 +2166,7 @@ async def admin_cards_list(callback: types.CallbackQuery):
     db.close()
     kb = build_cards_page_keyboard(cards, 0)
     await callback.message.edit_text(
-        f"🃏 <b>Карты ({len(cards)} шт.)</b>\nНажмите на карту, чтобы удалить.",
+        f"<b>Карты ({len(cards)} шт.)</b>\nНажмите на карту, чтобы удалить.",
         reply_markup=kb, parse_mode="HTML"
     )
 
@@ -2205,7 +2205,7 @@ async def card_view(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="« Назад к списку", style="primary", callback_data="admin_cards")],
     ]
     await callback.message.edit_text(
-        f"🃏 Карта: <b>{card['name']}</b>\n\nУдалить эту карту из расклада?",
+        f"Карта: <b>{card['name']}</b>\n\nУдалить эту карту из расклада?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
         parse_mode="HTML"
     )
@@ -2239,7 +2239,7 @@ async def card_delete(callback: types.CallbackQuery):
     db.close()
     kb = build_cards_page_keyboard(remaining, 0)
     await callback.message.edit_text(
-        f"✅ Карта «{name}» удалена.\n\n🃏 <b>Карты ({len(remaining)} шт.)</b>\nНажмите на карту, чтобы удалить.",
+        f'<tg-emoji emoji-id="5774022692642492953">✅</tg-emoji> Карта «{name}» удалена.\n\n<b>Карты ({len(remaining)} шт.)</b>\nНажмите на карту, чтобы удалить.',
         reply_markup=kb, parse_mode="HTML"
     )
 
@@ -2262,7 +2262,7 @@ async def card_add_photo(message: types.Message, state: FSMContext):
         await state.clear()
         return
     if not message.photo:
-        await message.answer("❌ Пришлите фото карты.")
+        await message.answer('<tg-emoji emoji-id="5774077015388852135">❌</tg-emoji> Пришлите фото карты.', parse_mode="HTML")
         return
     file_id = message.photo[-1].file_id
     await state.update_data(new_card_file_id=file_id)
@@ -2280,7 +2280,7 @@ async def card_add_name(message: types.Message, state: FSMContext):
         return
     name = message.text.strip() if message.text else ""
     if not name:
-        await message.answer("❌ Введите название карты.")
+        await message.answer('<tg-emoji emoji-id="5774077015388852135">❌</tg-emoji> Введите название карты.', parse_mode="HTML")
         return
     data = await state.get_data()
     file_id = data.get('new_card_file_id')
@@ -2292,8 +2292,8 @@ async def card_add_name(message: types.Message, state: FSMContext):
     total = len(get_active_cards(db))
     db.close()
     await message.answer(
-        f"✅ Карта «{name}» добавлена! Всего карт: {total}",
-        reply_markup=admin_menu_keyboard()
+        f'<tg-emoji emoji-id="5774022692642492953">✅</tg-emoji> Карта «{name}» добавлена! Всего карт: {total}',
+        reply_markup=admin_menu_keyboard(), parse_mode="HTML"
     )
 
 @dp.callback_query(F.data == "noop")
