@@ -50,6 +50,8 @@ from config import (
     LOG_CHAT_ID,
 )
 from cards_data import TAROT_CARDS, SUB_CARDS
+
+ALL_CARDS = TAROT_CARDS + SUB_CARDS
 from sqlalchemy import func
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -112,7 +114,7 @@ def get_card_of_the_day(db):
     need_new_card = not card_setting or not date_setting or date_setting.value != str(today)
 
     if need_new_card:
-        selected_card = random.choice(SUB_CARDS)
+        selected_card = random.choice(ALL_CARDS)
         card_json = json.dumps({"name": selected_card["name"]}, ensure_ascii=False)
 
         if not card_setting:
@@ -133,12 +135,12 @@ def get_card_of_the_day(db):
         try:
             saved = json.loads(card_setting.value)
             card_name = saved.get("name", "")
-            for card in SUB_CARDS:
+            for card in ALL_CARDS:
                 if card["name"] == card_name:
                     return card
         except Exception:
             pass
-        return random.choice(SUB_CARDS)
+        return random.choice(ALL_CARDS)
 
 def get_or_create_user(db, telegram_id, username, first_name):
     user = db.query(User).filter(User.telegram_id == telegram_id).first()
@@ -346,7 +348,7 @@ async def generate_daily_card_description(card_name: str) -> str:
 
 
 async def generate_tarot_reading(question):
-    selected_cards = random.sample(SUB_CARDS, 3)
+    selected_cards = random.sample(ALL_CARDS, 3)
     past_card = selected_cards[0]['name']
     present_card = selected_cards[1]['name']
     future_card = selected_cards[2]['name']
@@ -429,7 +431,7 @@ async def generate_palm_reading(photo_base64_data):
 
 
 async def generate_compatibility_reading(name1: str, dob1: str, name2: str, dob2: str):
-    selected_cards = random.sample(SUB_CARDS, 3)
+    selected_cards = random.sample(ALL_CARDS, 3)
     card_union = selected_cards[0]['name']
     card_challenges = selected_cards[1]['name']
     card_future = selected_cards[2]['name']
