@@ -49,7 +49,7 @@ from config import (
     YOOKASSA_SECRET_KEY,
     LOG_CHAT_ID,
 )
-from cards_data import TAROT_CARDS
+from cards_data import TAROT_CARDS, SUB_CARDS
 from sqlalchemy import func
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -112,7 +112,7 @@ def get_card_of_the_day(db):
     need_new_card = not card_setting or not date_setting or date_setting.value != str(today)
 
     if need_new_card:
-        selected_card = random.choice(TAROT_CARDS)
+        selected_card = random.choice(SUB_CARDS)
         card_json = json.dumps({"name": selected_card["name"]}, ensure_ascii=False)
 
         if not card_setting:
@@ -133,12 +133,12 @@ def get_card_of_the_day(db):
         try:
             saved = json.loads(card_setting.value)
             card_name = saved.get("name", "")
-            for card in TAROT_CARDS:
+            for card in SUB_CARDS:
                 if card["name"] == card_name:
                     return card
         except Exception:
             pass
-        return random.choice(TAROT_CARDS)
+        return random.choice(SUB_CARDS)
 
 def get_or_create_user(db, telegram_id, username, first_name):
     user = db.query(User).filter(User.telegram_id == telegram_id).first()
@@ -325,8 +325,28 @@ async def send_cards_album(chat_id: int, cards: list):
             except Exception:
                 pass
 
+async def generate_daily_card_description(card_name: str) -> str:
+    prompt = f"""Ты профессиональный таролог. Карта дня: {card_name}.
+
+Напиши короткое и ёмкое значение этой карты на сегодня (2-3 абзаца, 100-130 слов).
+Начни с краткого значения карты, потом — что она говорит на сегодня, в конце — один конкретный совет.
+Каждый абзац начинай с подходящего эмодзи. На русском, обращайся напрямую (ты/тебе), тон тёплый и честный."""
+
+    response = await asyncio.to_thread(
+        openai_client.chat.completions.create,
+        model=OPENAI_MODEL,
+        messages=[
+            {"role": "system", "content": "Ты таролог. Пиши кратко и по делу."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=400,
+        temperature=0.7
+    )
+    return response.choices[0].message.content.strip()
+
+
 async def generate_tarot_reading(question):
-    selected_cards = random.sample(TAROT_CARDS, 3)
+    selected_cards = random.sample(SUB_CARDS, 3)
     past_card = selected_cards[0]['name']
     present_card = selected_cards[1]['name']
     future_card = selected_cards[2]['name']
@@ -409,7 +429,7 @@ async def generate_palm_reading(photo_base64_data):
 
 
 async def generate_compatibility_reading(name1: str, dob1: str, name2: str, dob2: str):
-    selected_cards = random.sample(TAROT_CARDS, 3)
+    selected_cards = random.sample(SUB_CARDS, 3)
     card_union = selected_cards[0]['name']
     card_challenges = selected_cards[1]['name']
     card_future = selected_cards[2]['name']
@@ -700,9 +720,8 @@ async def daily_card(callback: types.CallbackQuery):
     db = SessionLocal()
     card = get_card_of_the_day(db)
 
-    text = (f"🌙 Карта дня: {card['name']}\n\n"
-            f"{card['description']}\n\n"
-            f"{card['meaning']}")
+    description = await generate_daily_card_description(card['name'])
+    text = f"🌙 Карта дня: {card['name']}\n\n{description}"
 
     keyboard = [[main_menu_button()]]
 
@@ -2071,12 +2090,11 @@ async def send_daily_card():
         users = db.query(User).all()
         local_path = card.get('image_path', '')
 
+        description = await generate_daily_card_description(card['name'])
+        text = f"🌞 Карта дня: {card['name']}\n\n{description}"
+
         for user in users:
             try:
-                text = (f"🌞 Карта дня: {card['name']}\n\n"
-                        f"{card['description']}\n\n"
-                        f"{card['meaning']}")
-
                 if local_path and os.path.isfile(local_path):
                     await bot.send_photo(
                         chat_id=user.telegram_id,
