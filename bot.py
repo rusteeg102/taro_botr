@@ -5,6 +5,7 @@ import random
 import base64
 import logging
 import uuid
+import hashlib
 from datetime import datetime, timedelta
 from io import BytesIO
 from openai import OpenAI
@@ -52,6 +53,74 @@ from config import (
 from cards_data import TAROT_CARDS, SUB_CARDS
 
 ALL_CARDS = TAROT_CARDS + SUB_CARDS
+
+
+def _card_hash(name: str) -> str:
+    return hashlib.md5(name.encode()).hexdigest()[:8]
+
+def get_disabled_cards(db) -> set:
+    s = db.query(Setting).filter(Setting.key == 'disabled_cards').first()
+    return set(json.loads(s.value)) if s and s.value else set()
+
+def set_disabled_cards(db, names: set):
+    s = db.query(Setting).filter(Setting.key == 'disabled_cards').first()
+    val = json.dumps(list(names), ensure_ascii=False)
+    if s:
+        s.value = val
+    else:
+        db.add(Setting(key='disabled_cards', value=val))
+    db.commit()
+
+def get_extra_cards(db) -> list:
+    s = db.query(Setting).filter(Setting.key == 'extra_cards').first()
+    return json.loads(s.value) if s and s.value else []
+
+def set_extra_cards(db, cards: list):
+    s = db.query(Setting).filter(Setting.key == 'extra_cards').first()
+    val = json.dumps(cards, ensure_ascii=False)
+    if s:
+        s.value = val
+    else:
+        db.add(Setting(key='extra_cards', value=val))
+    db.commit()
+
+def get_active_cards(db=None) -> list:
+    close_db = db is None
+    if close_db:
+        db = SessionLocal()
+    try:
+        disabled = get_disabled_cards(db)
+        extra = get_extra_cards(db)
+        base = [c for c in ALL_CARDS if c['name'] not in disabled]
+        return base + extra
+    finally:
+        if close_db:
+            db.close()
+
+CARDS_PER_PAGE = 10
+
+def build_cards_page_keyboard(cards: list, page: int) -> InlineKeyboardMarkup:
+    total_pages = max(1, (len(cards) + CARDS_PER_PAGE - 1) // CARDS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * CARDS_PER_PAGE
+    page_cards = cards[start:start + CARDS_PER_PAGE]
+
+    keyboard = []
+    for card in page_cards:
+        keyboard.append([InlineKeyboardButton(text=card['name'], callback_data=f"cview_{_card_hash(card['name'])}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"cpage_{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"cpage_{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+
+    keyboard.append([InlineKeyboardButton(text="➕ Добавить карту", style="success", callback_data="cadd")])
+    keyboard.append([InlineKeyboardButton(text="« Назад к админ-панели", style="primary", callback_data="admin_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 from sqlalchemy import func
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -100,6 +169,8 @@ class States(StatesGroup):
     COMPAT_NAME2 = State()
     BALANCE_USER = State()
     BALANCE_AMOUNT = State()
+    ADMIN_ADD_CARD_PHOTO = State()
+    ADMIN_ADD_CARD_NAME = State()
 
 QUESTION = "Какой вопрос вас волнует в данный момент? Опишите ситуацию более детально и кого она касается. Можно записать аудио."
 
@@ -113,8 +184,10 @@ def get_card_of_the_day(db):
     
     need_new_card = not card_setting or not date_setting or date_setting.value != str(today)
 
+    active = get_active_cards(db)
+
     if need_new_card:
-        selected_card = random.choice(ALL_CARDS)
+        selected_card = random.choice(active)
         card_json = json.dumps({"name": selected_card["name"]}, ensure_ascii=False)
 
         if not card_setting:
@@ -135,12 +208,12 @@ def get_card_of_the_day(db):
         try:
             saved = json.loads(card_setting.value)
             card_name = saved.get("name", "")
-            for card in ALL_CARDS:
+            for card in active:
                 if card["name"] == card_name:
                     return card
         except Exception:
             pass
-        return random.choice(ALL_CARDS)
+        return random.choice(active)
 
 def get_or_create_user(db, telegram_id, username, first_name):
     user = db.query(User).filter(User.telegram_id == telegram_id).first()
@@ -237,6 +310,7 @@ def admin_menu_keyboard():
         [InlineKeyboardButton(icon_custom_emoji_id="6043874504302661409", text="Выгрузка пользователей (Excel)", style="primary", callback_data="admin_export_users")],
         [InlineKeyboardButton(icon_custom_emoji_id="6039381989985882045", text="Рассылка пользователям", style="primary", callback_data="admin_broadcast")],
         [InlineKeyboardButton(icon_custom_emoji_id="5904462880941545555", text="Цены на расклады", style="primary", callback_data="admin_set_prices")],
+        [InlineKeyboardButton(text="🃏 Управление картами", style="primary", callback_data="admin_cards")],
         [InlineKeyboardButton(icon_custom_emoji_id="6032742198179532882", text="Сброс данных", style="primary", callback_data="admin_reset")],
         [InlineKeyboardButton(
             icon_custom_emoji_id="5920332557466997677",
@@ -289,11 +363,18 @@ async def transcribe_voice(audio_bytes: bytes) -> str:
     return await asyncio.to_thread(_transcribe)
 
 async def send_card_photo_safe(chat_id: int, card: dict, caption: str, reply_markup=None):
-    """Send a tarot card photo from local file, fallback to text."""
     local_path = card.get("image_path", "")
+    file_id = card.get("file_id", "")
     kwargs = {"chat_id": chat_id, "caption": caption[:1024]}
     if reply_markup:
         kwargs["reply_markup"] = reply_markup
+
+    if file_id:
+        try:
+            await bot.send_photo(photo=file_id, **kwargs)
+            return
+        except Exception as e:
+            logger.error(f"Card photo send (file_id) failed ({card.get('name')}): {e}")
 
     if local_path and os.path.isfile(local_path):
         try:
@@ -305,11 +386,13 @@ async def send_card_photo_safe(chat_id: int, card: dict, caption: str, reply_mar
     await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
 
 async def send_cards_album(chat_id: int, cards: list):
-    """Send tarot cards as one media group (album) from local files."""
     media = []
-    for i, card in enumerate(cards):
+    for card in cards:
+        file_id = card.get('file_id', '')
         local_path = card.get('image_path', '')
-        if local_path and os.path.isfile(local_path):
+        if file_id:
+            media.append(InputMediaPhoto(media=file_id))
+        elif local_path and os.path.isfile(local_path):
             media.append(InputMediaPhoto(media=FSInputFile(local_path)))
 
     if len(media) >= 2:
@@ -318,14 +401,16 @@ async def send_cards_album(chat_id: int, cards: list):
             return
         except Exception as e:
             logger.error(f"send_media_group failed: {e}")
-    # Fallback: send individually
     for card in cards:
+        file_id = card.get('file_id', '')
         local_path = card.get('image_path', '')
-        if local_path and os.path.isfile(local_path):
-            try:
+        try:
+            if file_id:
+                await bot.send_photo(chat_id=chat_id, photo=file_id)
+            elif local_path and os.path.isfile(local_path):
                 await bot.send_photo(chat_id=chat_id, photo=FSInputFile(local_path))
-            except Exception:
-                pass
+        except Exception:
+            pass
 
 async def generate_daily_card_description(card_name: str) -> str:
     prompt = f"""Ты профессиональный таролог. Карта дня: {card_name}.
@@ -348,7 +433,7 @@ async def generate_daily_card_description(card_name: str) -> str:
 
 
 async def generate_tarot_reading(question):
-    selected_cards = random.sample(ALL_CARDS, 3)
+    selected_cards = random.sample(get_active_cards(), 3)
     cards_str = ' · '.join(c['name'] for c in selected_cards)
 
     prompt = f"""Ты профессиональный таролог.
@@ -429,7 +514,7 @@ async def generate_palm_reading(photo_base64_data):
 
 
 async def generate_compatibility_reading(name1: str, dob1: str, name2: str, dob2: str):
-    selected_cards = random.sample(ALL_CARDS, 3)
+    selected_cards = random.sample(get_active_cards(), 3)
     cards_str = ' · '.join(c['name'] for c in selected_cards)
 
     dob_info = f" ({dob1})" if dob1 else ""
@@ -717,26 +802,20 @@ async def daily_card(callback: types.CallbackQuery):
     await callback.answer()
     db = SessionLocal()
     card = get_card_of_the_day(db)
+    db.close()
 
     description = await generate_daily_card_description(card['name'])
     text = f"🌙 Карта дня: {card['name']}\n\n{description}"
+    markup = InlineKeyboardMarkup(inline_keyboard=[[main_menu_button()]])
 
-    keyboard = [[main_menu_button()]]
-
-    sent = False
     try:
-        await send_card_photo_safe(
-            callback.from_user.id, card, text[:1024],
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
-        )
-        sent = True
+        await send_card_photo_safe(callback.from_user.id, card, text[:1024], reply_markup=markup)
         await callback.message.delete()
     except Exception:
-        pass
-    if not sent:
-        await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
-
-    db.close()
+        try:
+            await callback.message.edit_text(text, reply_markup=markup)
+        except Exception:
+            pass
 
 @dp.callback_query(F.data == "help")
 async def help_callback(callback: types.CallbackQuery):
@@ -1138,24 +1217,19 @@ async def question1(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "start_individual_reading")
 async def show_individual_reading(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
-    db = SessionLocal()
-    cost = get_individual_reading_cost(db)
-    user = get_or_create_user(db, callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
-
-    text = (
-        "✨ <b>Живой расклад от мастера</b>\n\n"
-        "Получите личный ответ от профессионального таролога.\n\n"
-        f"💰 Стоимость: <b>{cost:.0f} руб.</b>\n"
-        f"💵 Ваш баланс: <b>{user.balance:.2f} руб.</b>"
-    )
-
+    master = MASTER_USERNAME or "@master"
+    master_link = f"https://t.me/{master.lstrip('@')}"
     keyboard = [
-        [InlineKeyboardButton(text="🎯 Оплатить расклад", style="success", callback_data="confirm_individual_reading")],
+        [InlineKeyboardButton(text="💬 Написать мастеру", url=master_link)],
         [main_menu_button()]
     ]
-
-    db.close()
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode="HTML")
+    await callback.message.edit_text(
+        "✨ <b>Живой расклад от мастера</b>\n\n"
+        "Получите личный ответ от профессионального таролога.\n\n"
+        f"Напишите мастеру напрямую: {master}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        parse_mode="HTML"
+    )
 
 
 @dp.callback_query(F.data == "confirm_individual_reading")
@@ -2079,6 +2153,150 @@ async def reset_user(message: types.Message, state: FSMContext):
     await state.clear()
     db.close()
 
+
+
+@dp.callback_query(F.data == "admin_cards")
+async def admin_cards_list(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав.", show_alert=True)
+        return
+    await callback.answer()
+    db = SessionLocal()
+    cards = get_active_cards(db)
+    db.close()
+    kb = build_cards_page_keyboard(cards, 0)
+    await callback.message.edit_text(
+        f"🃏 <b>Карты ({len(cards)} шт.)</b>\nНажмите на карту, чтобы удалить.",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data.startswith("cpage_"))
+async def cards_page(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав.", show_alert=True)
+        return
+    await callback.answer()
+    page = int(callback.data.split("_")[1])
+    db = SessionLocal()
+    cards = get_active_cards(db)
+    db.close()
+    kb = build_cards_page_keyboard(cards, page)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+
+@dp.callback_query(F.data.startswith("cview_"))
+async def card_view(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав.", show_alert=True)
+        return
+    await callback.answer()
+    h = callback.data[6:]
+    db = SessionLocal()
+    cards = get_active_cards(db)
+    db.close()
+    card = next((c for c in cards if _card_hash(c['name']) == h), None)
+    if not card:
+        await callback.answer("Карта не найдена", show_alert=True)
+        return
+    keyboard = [
+        [InlineKeyboardButton(text="❌ Удалить карту", style="danger", callback_data=f"cdel_{h}")],
+        [InlineKeyboardButton(text="« Назад к списку", style="primary", callback_data="admin_cards")],
+    ]
+    await callback.message.edit_text(
+        f"🃏 Карта: <b>{card['name']}</b>\n\nУдалить эту карту из расклада?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data.startswith("cdel_"))
+async def card_delete(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав.", show_alert=True)
+        return
+    await callback.answer()
+    h = callback.data[5:]
+    db = SessionLocal()
+    cards = get_active_cards(db)
+    card = next((c for c in cards if _card_hash(c['name']) == h), None)
+    if not card:
+        db.close()
+        await callback.answer("Карта не найдена", show_alert=True)
+        return
+
+    name = card['name']
+    base_names = {c['name'] for c in ALL_CARDS}
+    if name in base_names:
+        disabled = get_disabled_cards(db)
+        disabled.add(name)
+        set_disabled_cards(db, disabled)
+    else:
+        extra = [c for c in get_extra_cards(db) if c['name'] != name]
+        set_extra_cards(db, extra)
+
+    remaining = get_active_cards(db)
+    db.close()
+    kb = build_cards_page_keyboard(remaining, 0)
+    await callback.message.edit_text(
+        f"✅ Карта «{name}» удалена.\n\n🃏 <b>Карты ({len(remaining)} шт.)</b>\nНажмите на карту, чтобы удалить.",
+        reply_markup=kb, parse_mode="HTML"
+    )
+
+@dp.callback_query(F.data == "cadd")
+async def card_add_start(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Нет прав.", show_alert=True)
+        return
+    await callback.answer()
+    await state.set_state(States.ADMIN_ADD_CARD_PHOTO)
+    await callback.message.edit_text(
+        "📸 Пришлите фото новой карты:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", style="danger", callback_data="admin_cards")]])
+    )
+
+@dp.message(States.ADMIN_ADD_CARD_PHOTO)
+async def card_add_photo(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if not message.photo:
+        await message.answer("❌ Пришлите фото карты.")
+        return
+    file_id = message.photo[-1].file_id
+    await state.update_data(new_card_file_id=file_id)
+    await state.set_state(States.ADMIN_ADD_CARD_NAME)
+    await message.answer(
+        "✏️ Теперь введите название карты:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", style="danger", callback_data="admin_cards")]])
+    )
+
+@dp.message(States.ADMIN_ADD_CARD_NAME)
+async def card_add_name(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    name = message.text.strip() if message.text else ""
+    if not name:
+        await message.answer("❌ Введите название карты.")
+        return
+    data = await state.get_data()
+    file_id = data.get('new_card_file_id')
+    await state.clear()
+    db = SessionLocal()
+    extra = get_extra_cards(db)
+    extra.append({"name": name, "file_id": file_id})
+    set_extra_cards(db, extra)
+    total = len(get_active_cards(db))
+    db.close()
+    await message.answer(
+        f"✅ Карта «{name}» добавлена! Всего карт: {total}",
+        reply_markup=admin_menu_keyboard()
+    )
+
+@dp.callback_query(F.data == "noop")
+async def noop(callback: types.CallbackQuery):
+    await callback.answer()
 
 
 async def send_daily_card():
