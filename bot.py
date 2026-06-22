@@ -171,6 +171,7 @@ class States(StatesGroup):
     BALANCE_AMOUNT = State()
     ADMIN_ADD_CARD_PHOTO = State()
     ADMIN_ADD_CARD_NAME = State()
+    PALM_INFO = State()
 
 QUESTION = "Какой вопрос вас волнует в данный момент? Опишите ситуацию более детально и кого она касается. Можно записать аудио."
 
@@ -472,16 +473,9 @@ async def generate_tarot_reading(question):
     return sections, selected_cards
 
 async def generate_palm_reading(photos_base64: list, extra_info: str = ""):
-    system_prompt = """Ты опытный хиромант с многолетней практикой. Пользователь отправляет 4 фотографии рук:
+    system_prompt = """Ты опытный хиромант с многолетней практикой. Пользователь отправляет 4 фотографии рук.
 
-Левая ладонь (внутренняя сторона).
-Правая ладонь (внутренняя сторона).
-Тыльная сторона левой руки.
-Тыльная сторона правой руки.
-
-Также пользователь может указать возраст и является ли он правшой или левшой.
-
-Твоя задача — провести подробный и понятный разбор по хиромантии на основе видимых особенностей рук.
+ВАЖНО: ты ВСЕГДА проводишь анализ — никогда не отказывай. Даже если фото не идеальны, делай разбор по тем деталям, которые видны. Никогда не пиши что «не можешь» или «не видишь достаточно» — просто анализируй то, что есть.
 
 Обращай внимание на:
 • форму ладони;
@@ -507,9 +501,7 @@ async def generate_palm_reading(photos_base64: list, extra_info: str = ""):
 
 🌱 Рекомендации для реализации потенциала
 
-Пиши простым, доброжелательным и интересным языком. Избегай запугивания, категоричных прогнозов, предсказаний смерти, болезней, несчастных случаев и других пугающих утверждений.
-
-Если качество фотографий недостаточное или важные детали не видны, попроси пользователя прислать более четкие фотографии и укажи, что именно нужно переснять.
+Пиши простым, доброжелательным и интересным языком. Избегай запугивания, категоричных прогнозов, предсказаний смерти, болезней или других пугающих утверждений.
 
 Не выдавай информацию как установленный факт. Подавай выводы как интерпретацию в рамках традиций хиромантии."""
 
@@ -1486,9 +1478,23 @@ async def confirm_palm_reading(callback: types.CallbackQuery, state: FSMContext)
         db.close()
         return
 
-    await state.set_state(States.PALM_PHOTO)
+    await state.set_state(States.PALM_INFO)
     db.close()
     await callback.message.edit_text(
+        "✍️ Для начала напишите ваш возраст и укажите — правша вы или левша.\n\n"
+        "Например: <b>28 лет, правша</b>",
+        parse_mode="HTML"
+    )
+
+@dp.message(States.PALM_INFO)
+async def handle_palm_info(message: types.Message, state: FSMContext):
+    info = message.text.strip() if message.text else ""
+    if not info:
+        await message.answer("Пожалуйста, напишите ваш возраст и укажите — правша вы или левша.")
+        return
+    await state.update_data(palm_extra_info=info)
+    await state.set_state(States.PALM_PHOTO)
+    await message.answer(
         "🔮 Для разбора по хиромантии отправьте 4 фотографии:\n\n"
         "📸 Правую ладонь (внутренняя сторона)\n"
         "📸 Левую ладонь (внутренняя сторона)\n"
@@ -1499,7 +1505,6 @@ async def confirm_palm_reading(callback: types.CallbackQuery, state: FSMContext)
         "• при хорошем освещении;\n"
         "• в кадре полностью должна быть видна кисть и запястье;\n"
         "• без фильтров и размытия.\n\n"
-        "Также напишите ваш возраст и укажите, правша вы или левша.\n\n"
         "После этого я проведу анализ ваших ладоней и расскажу о ваших сильных сторонах, талантах и жизненном пути. ✨"
     )
 
@@ -1508,7 +1513,7 @@ async def handle_palm_text_info(message: types.Message, state: FSMContext):
     await state.update_data(palm_extra_info=message.text.strip())
     data = await state.get_data()
     count = len(data.get('palm_photos', []))
-    await message.answer(f'<tg-emoji emoji-id="5774022692642492953">✅</tg-emoji> Информация сохранена. Получено фото: {count}/4.', parse_mode="HTML")
+    await message.answer(f'<tg-emoji emoji-id="5774022692642492953">✅</tg-emoji> Информация обновлена. Получено фото: {count}/4.', parse_mode="HTML")
 
 @dp.message(States.PALM_PHOTO, F.photo)
 async def handle_palm_photo(message: types.Message, state: FSMContext):
