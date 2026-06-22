@@ -471,35 +471,70 @@ async def generate_tarot_reading(question):
         sections = {"full": raw}
     return sections, selected_cards
 
-async def generate_palm_reading(photo_base64_data):
-    photo_url = f"data:image/jpeg;base64,{photo_base64_data}"
-    
-    prompt = """Ты хиромант. Сделай краткий расклад по фото ладони.
+async def generate_palm_reading(photos_base64: list, extra_info: str = ""):
+    system_prompt = """Ты опытный хиромант с многолетней практикой. Пользователь отправляет 4 фотографии рук:
 
-Структура (каждый пункт — 2-3 предложения, кратко и по делу):
+Левая ладонь (внутренняя сторона).
+Правая ладонь (внутренняя сторона).
+Тыльная сторона левой руки.
+Тыльная сторона правой руки.
 
-✨ Общая характеристика — темперамент и главные черты личности
-❤️ Сердечная линия — любовь и отношения
-🧠 Головная линия — мышление и работа
-🌱 Линия жизни — жизненный путь и здоровье
-💡 3 практических совета
+Также пользователь может указать возраст и является ли он правшой или левшой.
 
-Если есть явные шрамы или особые знаки — упомяни кратко.
-На русском, без терминов, как разговор с другом. Никогда не отказывай."""
-    
+Твоя задача — провести подробный и понятный разбор по хиромантии на основе видимых особенностей рук.
+
+Обращай внимание на:
+• форму ладони;
+• длину и форму пальцев;
+• большой палец;
+• холмы ладони;
+• линии жизни, головы, сердца, судьбы, Солнца и Меркурия;
+• особенности кожи, суставов и ногтей, если они хорошо видны;
+• различия между правой и левой рукой;
+• особенности тыльной стороны кистей.
+
+Структура ответа:
+
+🔮 Общая характеристика личности
+
+❤️ Любовь и отношения
+
+💰 Финансы и карьера
+
+✨ Сильные стороны и таланты
+
+⚠️ Возможные сложности и жизненные уроки
+
+🌱 Рекомендации для реализации потенциала
+
+Пиши простым, доброжелательным и интересным языком. Избегай запугивания, категоричных прогнозов, предсказаний смерти, болезней, несчастных случаев и других пугающих утверждений.
+
+Если качество фотографий недостаточное или важные детали не видны, попроси пользователя прислать более четкие фотографии и укажи, что именно нужно переснять.
+
+Не выдавай информацию как установленный факт. Подавай выводы как интерпретацию в рамках традиций хиромантии."""
+
+    intro = ("Пользователь отправляет 4 фотографии рук в следующем порядке:\n"
+             "1. Правая ладонь (внутренняя сторона)\n"
+             "2. Левая ладонь (внутренняя сторона)\n"
+             "3. Тыльная сторона правой руки\n"
+             "4. Тыльная сторона левой руки")
+    if extra_info:
+        intro += f"\n\nДополнительная информация от пользователя: {extra_info}"
+
+    user_content = [{"type": "text", "text": intro}]
+    for b64 in photos_base64:
+        user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}})
+
     for attempt in range(1, 4):
         try:
             response = await asyncio.to_thread(
                 lambda: openai_client.chat.completions.create(
                     model=OPENAI_MODEL,
                     messages=[
-                        {"role": "system", "content": "Ты опытный хиромант. Твоя задача — сделать интересный и детальный расклад по фото ладони на русском языке. Никогда не отказывай — всегда давай ответ!"},
-                        {"role": "user", "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": photo_url, "detail": "auto"}}
-                        ]}
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content}
                     ],
-                    max_tokens=1000,
+                    max_tokens=2000,
                     temperature=0.7
                 )
             )
@@ -514,36 +549,65 @@ async def generate_palm_reading(photo_base64_data):
 
 
 async def generate_compatibility_reading(name1: str, dob1: str, name2: str, dob2: str):
-    selected_cards = random.sample(get_active_cards(), 3)
-    cards_str = ' · '.join(c['name'] for c in selected_cards)
-
     dob_info = f" ({dob1})" if dob1 else ""
     dob_info2 = f" ({dob2})" if dob2 else ""
-    dob_hint = "Учитывай даты рождения в анализе совместимости." if dob1 and dob2 else ""
 
-    prompt = f"""Ты профессиональный таролог по отношениям.
+    prompt = f"""Ты эксперт по эзотерической совместимости пары, нумерологии и символическому анализу отношений.
 
-Пара: {name1}{dob_info} и {name2}{dob_info2}
-Карты расклада: {cards_str}
-{dob_hint}
+Пользователь указывает:
+• Имя первого партнёра: {name1}{dob_info}
+• Имя второго партнёра: {name2}{dob_info2}
 
-Напиши текст из 3-4 абзацев (200-250 слов) о том, что этот набор карт говорит об этих отношениях.
-Каждый абзац начинай с подходящего по смыслу эмодзи (разные для каждого абзаца).
-Раскрой общий смысл набора карт как единой картины — не разбирай каждую карту отдельно и не привязывай их к позициям.
-Будь честным: если карты показывают напряжение, несовместимость или риски — говори прямо, без смягчений.
-Обращайся к паре по именам. Последний абзац — конкретные советы.
-На русском, тон честный.
+На основе этих данных создай подробный разбор совместимости пары в эзотерическом стиле.
 
-Верни только JSON: {{"full": "<текст расклада>"}}"""
+Проанализируй:
+• энергетику каждого партнёра;
+• сильные стороны союза;
+• эмоциональную совместимость;
+• особенности общения;
+• романтическое притяжение;
+• совместные цели и ценности;
+• возможные точки напряжения;
+• перспективы развития отношений.
+
+Структура ответа:
+
+💕 Общая совместимость пары
+
+👤 Первый партнёр в отношениях
+
+👤 Второй партнёр в отношениях
+
+❤️ Любовь и эмоциональная связь
+
+🗣 Общение и взаимопонимание
+
+🔥 Романтическое и физическое притяжение
+
+💰 Совместные цели и материальная сфера
+
+⚡ Возможные сложности и уроки пары
+
+✨ Потенциал союза
+
+🌹 Рекомендации для гармоничных отношений
+
+Пиши простым, тёплым и понятным языком, словно опытный консультант разговаривает лично с клиентом. Ответ должен быть развёрнутым, интересным и уникальным для каждой пары.
+
+Не используй категоричные прогнозы. Не предсказывай смерть, болезни, измены, разводы или другие негативные события. Все выводы представляй как символическую эзотерическую интерпретацию для самопознания и размышлений.
+
+Минимальный объём ответа — 700 слов.
+
+Верни только JSON: {{"full": "<текст разбора>"}}"""
 
     response = await asyncio.to_thread(
         openai_client.chat.completions.create,
         model=OPENAI_MODEL,
         messages=[
-            {"role": "system", "content": "Ты таролог по отношениям. Отвечай ТОЛЬКО в JSON формате без markdown-блоков и без лишнего текста."},
+            {"role": "system", "content": "Ты эксперт по эзотерической совместимости. Отвечай ТОЛЬКО в JSON формате без markdown-блоков и без лишнего текста."},
             {"role": "user", "content": prompt}
         ],
-        max_tokens=1500,
+        max_tokens=2500,
         temperature=0.7
     )
     raw = response.choices[0].message.content.strip()
@@ -555,7 +619,7 @@ async def generate_compatibility_reading(name1: str, dob1: str, name2: str, dob2
             sections = {"full": raw}
     else:
         sections = {"full": raw}
-    return sections, selected_cards
+    return sections
 
 
 @dp.callback_query(F.data == "compatibility")
@@ -682,9 +746,9 @@ async def compat_name2(message: types.Message, state: FSMContext):
     db.close()
     await state.clear()
 
-    progress_msg = await message.answer("❤️ Раскладываем карты для вашей пары...")
+    progress_msg = await message.answer("❤️ Анализируем совместимость вашей пары...")
     try:
-        sections, selected_cards = await generate_compatibility_reading(name1, dob1, name2, dob2)
+        sections = await generate_compatibility_reading(name1, dob1, name2, dob2)
 
         db = SessionLocal()
         r = db.query(Reading).filter(Reading.id == reading_id).first()
@@ -693,7 +757,6 @@ async def compat_name2(message: types.Message, state: FSMContext):
         db.close()
 
         await progress_msg.delete()
-        await send_cards_album(message.chat.id, selected_cards)
         await message.answer(sections.get('full', ''), reply_markup=back_to_menu_keyboard())
     except Exception as e:
         logger.error(f"Compatibility reading error: {e}")
@@ -1092,7 +1155,7 @@ async def confirm_standard_reading(callback: types.CallbackQuery, state: FSMCont
         await state.update_data(is_free=True)
         await state.set_state(States.QUESTION1)
         db.close()
-        await callback.message.edit_text(QUESTION, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
+        await callback.message.edit_text(QUESTION)
         return
 
     admin_demo = is_admin(callback.from_user.id) and get_demo_balance(db)
@@ -1101,15 +1164,14 @@ async def confirm_standard_reading(callback: types.CallbackQuery, state: FSMCont
             f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Недостаточно средств для расклада.\n"
             f"Стоимость расклада: {cost:.2f} руб.\n"
             f"Пополните баланс, используя кнопку '💰 Баланс'.",
-            reply_markup=back_to_menu_keyboard()
-        , parse_mode="HTML")
+            reply_markup=back_to_menu_keyboard(), parse_mode="HTML")
         db.close()
         return
 
     await state.update_data(is_free=False)
     await state.set_state(States.QUESTION1)
     db.close()
-    await callback.message.edit_text(QUESTION, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
+    await callback.message.edit_text(QUESTION)
 
 @dp.message(States.QUESTION1)
 async def question1(message: types.Message, state: FSMContext):
@@ -1426,15 +1488,54 @@ async def confirm_palm_reading(callback: types.CallbackQuery, state: FSMContext)
 
     await state.set_state(States.PALM_PHOTO)
     db.close()
-    await callback.message.edit_text("Пожалуйста, отправьте фото вашей ладони:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отмена", icon_custom_emoji_id="5774077015388852135", style="danger", callback_data="menu")]]))
+    await callback.message.edit_text(
+        "🔮 Для разбора по хиромантии отправьте 4 фотографии:\n\n"
+        "📸 Правую ладонь (внутренняя сторона)\n"
+        "📸 Левую ладонь (внутренняя сторона)\n"
+        "📸 Тыльную сторону правой руки\n"
+        "📸 Тыльную сторону левой руки\n\n"
+        "Важно:\n"
+        "• фото должны быть чёткими;\n"
+        "• при хорошем освещении;\n"
+        "• в кадре полностью должна быть видна кисть и запястье;\n"
+        "• без фильтров и размытия.\n\n"
+        "Также напишите ваш возраст и укажите, правша вы или левша.\n\n"
+        "После этого я проведу анализ ваших ладоней и расскажу о ваших сильных сторонах, талантах и жизненном пути. ✨"
+    )
+
+@dp.message(States.PALM_PHOTO, F.text)
+async def handle_palm_text_info(message: types.Message, state: FSMContext):
+    await state.update_data(palm_extra_info=message.text.strip())
+    data = await state.get_data()
+    count = len(data.get('palm_photos', []))
+    await message.answer(f'<tg-emoji emoji-id="5774022692642492953">✅</tg-emoji> Информация сохранена. Получено фото: {count}/4.', parse_mode="HTML")
 
 @dp.message(States.PALM_PHOTO, F.photo)
 async def handle_palm_photo(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    photos = data.get('palm_photos', [])
+
+    photo = message.photo[-1]
+    file_info = await bot.get_file(photo.file_id)
+    file_bytes = await bot.download_file(file_info.file_path)
+    photos.append(base64.b64encode(file_bytes.getvalue()).decode('utf-8'))
+
+    if message.caption:
+        await state.update_data(palm_extra_info=message.caption.strip())
+
+    if len(photos) < 4:
+        await state.update_data(palm_photos=photos)
+        await message.answer(f"Получено {len(photos)}/4 фото. Осталось: {4 - len(photos)}.")
+        return
+
+    extra_info = data.get('palm_extra_info', '')
+    await state.clear()
+
     db = SessionLocal()
     cost = get_palm_reading_cost(db)
     user = get_or_create_user(db, message.from_user.id, message.from_user.username, message.from_user.first_name)
-
     admin = is_admin(message.from_user.id) and get_demo_balance(db)
+
     if not admin and user.balance < cost:
         await message.answer(
             f"<tg-emoji emoji-id=\"5774077015388852135\">❌</tg-emoji> Недостаточно средств для расклада.\n"
@@ -1442,7 +1543,6 @@ async def handle_palm_photo(message: types.Message, state: FSMContext):
             f"Пополните баланс, используя кнопку '💰 Баланс'.",
             reply_markup=back_to_menu_keyboard(), parse_mode="HTML"
         )
-        await state.clear()
         db.close()
         return
 
@@ -1474,16 +1574,10 @@ async def handle_palm_photo(message: types.Message, state: FSMContext):
     )
     db.close()
 
-    await state.clear()
-    progress_msg = await message.answer("✋ Анализируем ладонь...")
+    progress_msg = await message.answer("✋ Анализируем ладони...")
 
     try:
-        photo = message.photo[-1]
-        file_info = await bot.get_file(photo.file_id)
-        file_bytes = await bot.download_file(file_info.file_path)
-        photo_base64 = base64.b64encode(file_bytes.getvalue()).decode('utf-8')
-
-        response = await generate_palm_reading(photo_base64)
+        response = await generate_palm_reading(photos, extra_info)
 
         db = SessionLocal()
         r = db.query(Reading).filter(Reading.id == reading_id).first()
@@ -1491,7 +1585,7 @@ async def handle_palm_photo(message: types.Message, state: FSMContext):
         db.commit()
         db.close()
 
-        await progress_msg.edit_text(f"✨ Ваш расклад по ладони готов!\n\n{response}", reply_markup=back_to_menu_keyboard())
+        await progress_msg.edit_text(f"✨ Ваш анализ готов!\n\n{response}", reply_markup=back_to_menu_keyboard())
     except Exception as e:
         logger.error(f"Palm reading error: {e}")
         await progress_msg.edit_text(
